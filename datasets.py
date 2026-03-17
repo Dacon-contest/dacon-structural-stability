@@ -25,7 +25,7 @@ def get_train_transforms(img_size=384):
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.2),
         A.RandomRotate90(p=0.3),
-        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=30, p=0.5),
+        A.Affine(translate_percent=(-0.1, 0.1), scale=(0.8, 1.2), rotate=(-30, 30), p=0.5),
         A.OneOf([
             A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=1.0),
             A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=30, p=1.0),
@@ -37,12 +37,12 @@ def get_train_transforms(img_size=384):
             A.MedianBlur(blur_limit=5, p=1.0),
         ], p=0.3),
         A.OneOf([
-            A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+            A.GaussNoise(std_range=(0.1, 0.5), p=1.0),
             A.ISONoise(p=1.0),
         ], p=0.3),
         A.RandomShadow(p=0.2),
-        A.RandomFog(fog_coef_lower=0.1, fog_coef_upper=0.3, p=0.1),
-        A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.3),
+        A.RandomFog(fog_coef_range=(0.1, 0.3), p=0.1),
+        A.CoarseDropout(num_holes_range=(1, 8), hole_height_range=(16, 32), hole_width_range=(16, 32), p=0.3),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
@@ -208,41 +208,46 @@ class ShapeStacksDataset(Dataset):
         self.transform = transform
         self.samples = []  # (img_path, label)
 
-        meta_root = os.path.join(data_root, "shapestacks-meta")
-        rgb_root = os.path.join(data_root, "shapestacks-rgb")
+        # 실제 구조: data_root/shapestacks/recordings/<scenario>/*.png
+        inner_root = os.path.join(data_root, "shapestacks")
+        recordings_dir = os.path.join(inner_root, "recordings")
+        splits_file = os.path.join(inner_root, "splits", "default", f"{split}.txt")
 
-        if not os.path.exists(meta_root) or not os.path.exists(rgb_root):
-            print(f"[WARNING] ShapeStacks data not found at {data_root}")
+        if not os.path.exists(recordings_dir):
+            print(f"[WARNING] ShapeStacks recordings not found at {recordings_dir}")
             return
 
-        # 메타데이터에서 안정/불안정 라벨 로드
-        label_dirs = {
-            "stable": glob.glob(os.path.join(meta_root, "**", "*stable*"), recursive=True),
-            "unstable": glob.glob(os.path.join(meta_root, "**", "*unstable*"), recursive=True),
-        }
+        # split 파일이 있으면 해당 시나리오만 사용
+        scenario_filter = None
+        if os.path.exists(splits_file):
+            with open(splits_file, "r") as f:
+                scenario_filter = set(line.strip() for line in f if line.strip())
 
-        # RGB 이미지 검색
-        all_imgs = glob.glob(os.path.join(rgb_root, "**", "*.png"), recursive=True)
-        if not all_imgs:
-            all_imgs = glob.glob(os.path.join(rgb_root, "**", "*.jpg"), recursive=True)
+        # 시나리오 폴더 순회, 폴더명에서 라벨 파싱
+        # vcom=0 AND vpsf=0 → stable(0), otherwise unstable(1)
+        for scenario_name in os.listdir(recordings_dir):
+            scenario_path = os.path.join(recordings_dir, scenario_name)
+            if not os.path.isdir(scenario_path):
+                continue
+            if scenario_filter and scenario_name not in scenario_filter:
+                continue
 
-        # 디렉토리명에서 stable/unstable 구분
-        for img_path in all_imgs:
-            dirname = os.path.dirname(img_path).lower()
-            if "unstable" in dirname or "collapse" in dirname:
-                self.samples.append((img_path, 1))  # unstable
-            elif "stable" in dirname:
-                self.samples.append((img_path, 0))  # stable
-            else:
-                # 파일 구조에 따라 기본 분류
-                parent_parts = img_path.replace("\\", "/").split("/")
-                for part in parent_parts:
-                    if "unstable" in part.lower():
-                        self.samples.append((img_path, 1))
+            # 라벨 파싱
+            label = 0  # default stable
+            parts = scenario_name.split("-")
+            for part in parts:
+                if part.startswith("vcom=") or part.startswith("vpsf="):
+                    val = int(part.split("=")[1])
+                    if val > 0:
+                        label = 1  # unstable
                         break
-                    elif "stable" in part.lower():
-                        self.samples.append((img_path, 0))
-                        break
+
+            # 해당 시나리오의 모든 PNG 이미지 수집 (카메라 앵글별)
+            for img_name in os.listdir(scenario_path):
+                if img_name.endswith(".png"):
+                    self.samples.append(
+                        (os.path.join(scenario_path, img_name), label)
+                    )
 
         if max_samples and len(self.samples) > max_samples:
             random.shuffle(self.samples)

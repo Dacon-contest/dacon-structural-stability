@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import log_loss
 from tqdm import tqdm
@@ -134,11 +134,11 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_mix
 
         if use_mixup and random.random() < 0.5:
             front, top, labels_a, labels_b, lam = mixup_data(front, top, labels)
-            with autocast():
+            with autocast('cuda'):
                 logits = model(front, top)
                 loss = lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
         else:
-            with autocast():
+            with autocast('cuda'):
                 logits = model(front, top)
                 loss = criterion(logits, labels)
 
@@ -170,7 +170,7 @@ def validate(model, loader, criterion, device):
     for batch in tqdm(loader, desc="Val", leave=False):
         front, top, labels = batch[0].to(device), batch[1].to(device), batch[2].to(device)
 
-        with autocast():
+        with autocast('cuda'):
             logits = model(front, top)
             loss = criterion(logits, labels)
 
@@ -190,6 +190,34 @@ def validate(model, loader, criterion, device):
     return avg_loss, logloss, accuracy
 
 
+class FlexibleDualViewDataset(torch.utils.data.Dataset):
+    """유연한 Dual-View 데이터셋 (train+dev 혼합 가능)"""
+
+    def __init__(self, samples, transform=None):
+        """samples: list of (data_dir, sample_id, label_int)"""
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        import cv2
+        data_dir, sample_id, label = self.samples[idx]
+        sample_dir = os.path.join(data_dir, sample_id)
+
+        front = cv2.imread(os.path.join(sample_dir, "front.png"))
+        front = cv2.cvtColor(front, cv2.COLOR_BGR2RGB)
+        top = cv2.imread(os.path.join(sample_dir, "top.png"))
+        top = cv2.cvtColor(top, cv2.COLOR_BGR2RGB)
+
+        if self.transform:
+            front = self.transform(image=front)["image"]
+            top = self.transform(image=top)["image"]
+
+        return front, top, torch.tensor(label, dtype=torch.long)
+
+
 def pretrain(args):
     """Stage 1: 외부 데이터로 pretrain"""
     set_seed(args.seed)
@@ -204,21 +232,41 @@ def pretrain(args):
     train_tf = get_train_transforms(img_size)
     val_tf = get_val_transforms(img_size)
 
-    # Archive 블록 데이터
+    # --- 데이터셋 수집 ---
     datasets_list = []
+
+    # 1) Open 데이터 (train + dev) - 무조건 사용
+    train_csv = os.path.join(DATA_DIR, "open", "train.csv")
+    dev_csv = os.path.join(DATA_DIR, "open", "dev.csv")
+    open_samples = []
+    for csv_path, source in [(train_csv, "train"), (dev_csv, "dev")]:
+        if os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            for _, row in df.iterrows():
+                data_dir = os.path.join(DATA_DIR, "open", source)
+                label_int = 1 if row["label"] == "unstable" else 0
+                open_samples.append((data_dir, row["id"], label_int))
+    if open_samples:
+        open_ds = FlexibleDualViewDataset(open_samples, train_tf)
+        datasets_list.append(open_ds)
+        print(f"  Open dataset (train+dev): {len(open_ds)} samples")
+
+    # 2) Archive 블록 데이터 (default 10,000장)
     archive_csv = os.path.join(DATA_DIR, "archive", "blocks-labels.csv")
     archive_dir = os.path.join(DATA_DIR, "archive")
     if os.path.exists(archive_csv):
+        max_arc = args.max_archive_samples if args.max_archive_samples > 0 else None
         archive_ds = ArchiveBlockDataset(archive_csv, archive_dir, transform=train_tf,
-                                          max_samples=args.max_pretrain_samples)
+                                          max_samples=max_arc)
         datasets_list.append(archive_ds)
         print(f"  Archive dataset: {len(archive_ds)} samples")
 
-    # ShapeStacks 데이터
+    # 3) ShapeStacks 데이터 (default 전부)
     shapestacks_dir = os.path.join(DATA_DIR, "shapestacks")
     if os.path.exists(shapestacks_dir):
+        max_ss = args.max_shapestacks_samples if args.max_shapestacks_samples > 0 else None
         ss_ds = ShapeStacksDataset(shapestacks_dir, transform=train_tf,
-                                    max_samples=args.max_pretrain_samples)
+                                    max_samples=max_ss)
         if len(ss_ds) > 0:
             datasets_list.append(ss_ds)
             print(f"  ShapeStacks dataset: {len(ss_ds)} samples")
@@ -230,7 +278,7 @@ def pretrain(args):
     combined = CombinedDataset(datasets_list)
     print(f"  Total pretrain samples: {len(combined)}")
 
-    # 80/20 split
+    # 90/10 split
     n = len(combined)
     n_val = max(int(n * 0.1), 100)
     n_train = n - n_val
@@ -250,10 +298,24 @@ def pretrain(args):
         optimizer, T_0=5, T_mult=2, eta_min=1e-6
     )
     criterion = FocalLoss(alpha=0.25, gamma=2.0)
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
 
     best_logloss = float("inf")
-    for epoch in range(args.pretrain_epochs):
+    start_epoch = 0
+
+    # 체크포인트에서 이어서 학습
+    ckpt_path = os.path.join(SAVE_DIR, f"{args.model}_pretrain_ckpt.pth")
+    if args.resume and os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_logloss = ckpt["best_logloss"]
+        print(f"  >>> Resumed from epoch {start_epoch} (best LogLoss: {best_logloss:.4f})")
+
+    for epoch in range(start_epoch, args.pretrain_epochs):
         print(f"\nEpoch {epoch + 1}/{args.pretrain_epochs}")
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer,
                                       scaler, device, use_mixup=True)
@@ -262,6 +324,16 @@ def pretrain(args):
 
         print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
               f"Val LogLoss: {val_logloss:.4f} | Val Acc: {val_acc:.4f}")
+
+        # 매 에폭 체크포인트 저장 (중단 대비)
+        torch.save({
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "best_logloss": best_logloss,
+        }, ckpt_path)
 
         if val_logloss < best_logloss:
             best_logloss = val_logloss
@@ -370,11 +442,25 @@ def finetune(args):
         smooth = LabelSmoothingLoss(num_classes=2, smoothing=0.05)
         criterion = lambda logits, targets: 0.7 * focal(logits, targets) + 0.3 * smooth(logits, targets)
 
-        scaler = GradScaler()
+        scaler = GradScaler('cuda')
         best_logloss = float("inf")
         patience_count = 0
+        start_epoch = 0
 
-        for epoch in range(args.finetune_epochs):
+        # 체크포인트에서 이어서 학습
+        fold_ckpt_path = os.path.join(SAVE_DIR, f"{args.model}_fold{fold}_ckpt.pth")
+        if args.resume and os.path.exists(fold_ckpt_path):
+            ckpt = torch.load(fold_ckpt_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            scaler.load_state_dict(ckpt["scaler"])
+            start_epoch = ckpt["epoch"] + 1
+            best_logloss = ckpt["best_logloss"]
+            patience_count = ckpt.get("patience_count", 0)
+            print(f"  >>> Resumed fold {fold} from epoch {start_epoch} (best LogLoss: {best_logloss:.6f})")
+
+        for epoch in range(start_epoch, args.finetune_epochs):
             print(f"\n  Epoch {epoch + 1}/{args.finetune_epochs}")
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer,
                                           scaler, device, use_mixup=True)
@@ -383,6 +469,17 @@ def finetune(args):
 
             print(f"    Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                   f"Val LogLoss: {val_logloss:.6f} | Val Acc: {val_acc:.4f}")
+
+            # 매 에폭 체크포인트 저장 (중단 대비)
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "best_logloss": best_logloss,
+                "patience_count": patience_count,
+            }, fold_ckpt_path)
 
             if val_logloss < best_logloss:
                 best_logloss = val_logloss
@@ -405,34 +502,6 @@ def finetune(args):
         print(f"{'=' * 60}")
 
 
-class FlexibleDualViewDataset(torch.utils.data.Dataset):
-    """유연한 Dual-View 데이터셋 (train+dev 혼합 가능)"""
-
-    def __init__(self, samples, transform=None):
-        """samples: list of (data_dir, sample_id, label_int)"""
-        self.samples = samples
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        import cv2
-        data_dir, sample_id, label = self.samples[idx]
-        sample_dir = os.path.join(data_dir, sample_id)
-
-        front = cv2.imread(os.path.join(sample_dir, "front.png"))
-        front = cv2.cvtColor(front, cv2.COLOR_BGR2RGB)
-        top = cv2.imread(os.path.join(sample_dir, "top.png"))
-        top = cv2.cvtColor(top, cv2.COLOR_BGR2RGB)
-
-        if self.transform:
-            front = self.transform(image=front)["image"]
-            top = self.transform(image=top)["image"]
-
-        return front, top, torch.tensor(label, dtype=torch.long)
-
-
 def main():
     parser = argparse.ArgumentParser(description="구조물 안정성 예측 학습")
     parser.add_argument("--model", type=str, default="efficientnet",
@@ -445,7 +514,10 @@ def main():
     parser.add_argument("--fold", type=int, default=None, help="특정 fold만 학습")
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max_pretrain_samples", type=int, default=50000)
+    parser.add_argument("--max_archive_samples", type=int, default=10000)
+    parser.add_argument("--max_shapestacks_samples", type=int, default=0,
+                        help="0=use all")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     args = parser.parse_args()
 
     print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
