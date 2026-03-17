@@ -11,6 +11,7 @@
   python train.py --model swinv2 --stage finetune
 """
 import argparse
+import csv
 import os
 import random
 import time
@@ -120,19 +121,74 @@ def mixup_data(x1, x2, y, alpha=0.4):
     return mixed_x1, mixed_x2, y_a, y_b, lam
 
 
+def format_seconds(seconds):
+    seconds = int(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def append_log_row(csv_path, row):
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    fieldnames = list(row.keys())
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def print_epoch_summary(epoch, total_epochs, lr, train_metrics, val_metrics,
+                        best_logloss, elapsed_sec, monitor_label, extra_metrics=None):
+    train_acc = train_metrics['acc'] if train_metrics['acc'] is not None else float('nan')
+    print(
+        f"  Epoch [{epoch}/{total_epochs}] | lr={lr:.2e} | time={format_seconds(elapsed_sec)}"
+    )
+    if train_metrics['acc'] is not None:
+        print(
+            f"    Train  loss={train_metrics['loss']:.4f} | acc={train_acc:.4f} "
+            f"(non-mixup {train_metrics['measured_samples']} samples) | "
+            f"mixup={train_metrics['mixup_batches']}/{train_metrics['num_batches']} batches"
+        )
+    else:
+        print(
+            f"    Train  loss={train_metrics['loss']:.4f} | "
+            f"mixup={train_metrics['mixup_batches']}/{train_metrics['num_batches']} batches"
+        )
+    print(
+        f"    {monitor_label:<6} loss={val_metrics['loss']:.4f} | "
+        f"logloss={val_metrics['logloss']:.4f} | acc={val_metrics['acc']:.4f}"
+    )
+    if extra_metrics is not None:
+        print(
+            f"    Dev   loss={extra_metrics['loss']:.4f} | "
+            f"logloss={extra_metrics['logloss']:.4f} | acc={extra_metrics['acc']:.4f}"
+        )
+    print(f"    Best {monitor_label.lower()} logloss so far: {best_logloss:.4f}")
+
+
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_mixup=True):
     model.train()
     total_loss = 0.0
+    processed_samples = 0
     correct = 0
     total = 0
 
+    mixup_batches = 0
+    start_time = time.time()
+
     pbar = tqdm(loader, desc="Train", leave=False)
-    for batch in pbar:
+    for step, batch in enumerate(pbar, start=1):
         front, top, labels = batch[0].to(device), batch[1].to(device), batch[2].to(device)
 
         optimizer.zero_grad()
 
-        if use_mixup and random.random() < 0.5:
+        mixup_applied = use_mixup and random.random() < 0.5
+        if mixup_applied:
+            mixup_batches += 1
             front, top, labels_a, labels_b, lam = mixup_data(front, top, labels)
             with autocast('cuda'):
                 logits = model(front, top)
@@ -149,14 +205,31 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_mix
         scaler.update()
 
         total_loss += loss.item() * front.size(0)
+        processed_samples += front.size(0)
         preds = logits.argmax(dim=1)
-        correct += (preds == labels).sum().item() if not use_mixup or random.random() >= 0.5 else 0
-        total += front.size(0)
+        if not mixup_applied:
+            correct += (preds == labels).sum().item()
+            total += front.size(0)
+        avg_loss = total_loss / processed_samples
+        postfix = {
+            "loss": f"{loss.item():.4f}",
+            "avg": f"{avg_loss:.4f}",
+            "mixup": f"{mixup_batches}/{step}",
+        }
+        if total > 0:
+            postfix["acc"] = f"{correct / total:.3f}"
+        pbar.set_postfix(postfix)
 
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
-
-    avg_loss = total_loss / total
-    return avg_loss
+    total_samples = len(loader.dataset)
+    avg_loss = total_loss / total_samples
+    return {
+        "loss": avg_loss,
+        "acc": (correct / total) if total > 0 else None,
+        "measured_samples": total,
+        "mixup_batches": mixup_batches,
+        "num_batches": len(loader),
+        "elapsed_sec": time.time() - start_time,
+    }
 
 
 @torch.no_grad()
@@ -166,6 +239,7 @@ def validate(model, loader, criterion, device):
     all_labels = []
     total_loss = 0.0
     total = 0
+    start_time = time.time()
 
     for batch in tqdm(loader, desc="Val", leave=False):
         front, top, labels = batch[0].to(device), batch[1].to(device), batch[2].to(device)
@@ -187,7 +261,12 @@ def validate(model, loader, criterion, device):
     logloss = log_loss(all_labels, all_probs, labels=[0, 1])
     accuracy = (all_probs.argmax(axis=1) == all_labels).mean()
 
-    return avg_loss, logloss, accuracy
+    return {
+        "loss": avg_loss,
+        "logloss": logloss,
+        "acc": accuracy,
+        "elapsed_sec": time.time() - start_time,
+    }
 
 
 class TransformDataset(torch.utils.data.Dataset):
@@ -295,6 +374,7 @@ def pretrain(args):
 
     combined = CombinedDataset(datasets_list)
     print(f"  Total pretrain samples: {len(combined)}")
+    print("  Monitor target: mixed pretrain split validation (not competition dev score)")
 
     # 90/10 split (transform 없는 상태로 분할 → 각각 다른 transform 적용)
     n = len(combined)
@@ -306,9 +386,9 @@ def pretrain(args):
     val_ds = TransformDataset(val_subset, val_tf)
 
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"],
-                               shuffle=True, num_workers=4, pin_memory=True)
+                               shuffle=True, num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"],
-                             shuffle=False, num_workers=4, pin_memory=True)
+                             shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
     model = build_model(args.model, pretrained=True, num_classes=2, drop_rate=0.3)
     model = model.to(device)
@@ -326,6 +406,7 @@ def pretrain(args):
     )
     criterion = FocalLoss(alpha=0.25, gamma=2.0)
     scaler = GradScaler('cuda')
+    log_path = os.path.join(SAVE_DIR, f"{args.model}_pretrain_log.csv")
 
     best_logloss = float("inf")
     start_epoch = 0
@@ -344,13 +425,39 @@ def pretrain(args):
 
     for epoch in range(start_epoch, args.pretrain_epochs):
         print(f"\nEpoch {epoch + 1}/{args.pretrain_epochs}")
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer,
-                                      scaler, device, use_mixup=True)
-        val_loss, val_logloss, val_acc = validate(model, val_loader, criterion, device)
+        epoch_start = time.time()
+        train_metrics = train_one_epoch(model, train_loader, criterion, optimizer,
+                                        scaler, device, use_mixup=True)
+        val_metrics = validate(model, val_loader, criterion, device)
         scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+        improved = val_metrics["logloss"] < best_logloss
+        if improved:
+            best_logloss = val_metrics["logloss"]
 
-        print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-              f"Val LogLoss: {val_logloss:.4f} | Val Acc: {val_acc:.4f}")
+        print_epoch_summary(
+            epoch=epoch + 1,
+            total_epochs=args.pretrain_epochs,
+            lr=current_lr,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            best_logloss=best_logloss,
+            elapsed_sec=time.time() - epoch_start,
+            monitor_label="Val",
+        )
+
+        append_log_row(log_path, {
+            "epoch": epoch + 1,
+            "lr": current_lr,
+            "train_loss": train_metrics["loss"],
+            "train_acc_non_mixup": train_metrics["acc"],
+            "mixup_batches": train_metrics["mixup_batches"],
+            "val_loss": val_metrics["loss"],
+            "val_logloss": val_metrics["logloss"],
+            "val_acc": val_metrics["acc"],
+            "best_val_logloss": best_logloss,
+            "epoch_time_sec": time.time() - epoch_start,
+        })
 
         # 매 에폭 체크포인트 저장 (중단 대비)
         torch.save({
@@ -362,11 +469,10 @@ def pretrain(args):
             "best_logloss": best_logloss,
         }, ckpt_path)
 
-        if val_logloss < best_logloss:
-            best_logloss = val_logloss
+        if improved:
             save_path = os.path.join(SAVE_DIR, f"{args.model}_pretrained.pth")
             torch.save(model.state_dict(), save_path)
-            print(f"  >>> Saved best pretrained model (LogLoss: {val_logloss:.4f})")
+            print(f"    >>> Saved best pretrained model (LogLoss: {val_metrics['logloss']:.4f})")
 
     print(f"\n  Best pretrain LogLoss: {best_logloss:.4f}")
 
@@ -382,7 +488,7 @@ def finetune(args):
     print(f" Stage 2: FINETUNE [{args.model}] (5-Fold)")
     print("=" * 60)
 
-    # Train + Dev 데이터 결합
+    # 기본값은 train만 사용해 honest CV를 측정하고, dev는 외부 holdout으로만 본다.
     train_csv = os.path.join(DATA_DIR, "open", "train.csv")
     dev_csv = os.path.join(DATA_DIR, "open", "dev.csv")
     train_df = pd.read_csv(train_csv)
@@ -390,17 +496,26 @@ def finetune(args):
 
     train_df["source"] = "train"
     dev_df["source"] = "dev"
-    combined_df = pd.concat([train_df, dev_df], ignore_index=True)
-    combined_df["label_int"] = (combined_df["label"] == "unstable").astype(int)
+    train_df["label_int"] = (train_df["label"] == "unstable").astype(int)
+    dev_df["label_int"] = (dev_df["label"] == "unstable").astype(int)
 
-    print(f"  Total samples: {len(combined_df)} (Train: {len(train_df)}, Dev: {len(dev_df)})")
-    print(f"  Label dist: stable={sum(combined_df['label_int']==0)}, "
-          f"unstable={sum(combined_df['label_int']==1)}")
+    if args.include_dev_in_finetune:
+        finetune_df = pd.concat([train_df, dev_df], ignore_index=True)
+        print(f"  Training pool: {len(finetune_df)} samples (train+dev)")
+        print("  Dev holdout monitor: disabled because dev is included in training")
+    else:
+        finetune_df = train_df.copy()
+        print(f"  Training pool: {len(finetune_df)} train samples")
+        print(f"  External dev holdout: {len(dev_df)} samples (same env as test)")
+
+    print(f"  Label dist: stable={sum(finetune_df['label_int']==0)}, "
+          f"unstable={sum(finetune_df['label_int']==1)}")
+    print("  Model selection target: fold validation logloss")
 
     skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
     fold_results = []
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(combined_df, combined_df["label_int"])):
+    for fold, (train_idx, val_idx) in enumerate(skf.split(finetune_df, finetune_df["label_int"])):
         if args.fold is not None and fold != args.fold:
             continue
 
@@ -408,8 +523,8 @@ def finetune(args):
         print(f" Fold {fold + 1}/{args.n_folds}")
         print(f"{'=' * 40}")
 
-        fold_train_df = combined_df.iloc[train_idx].reset_index(drop=True)
-        fold_val_df = combined_df.iloc[val_idx].reset_index(drop=True)
+        fold_train_df = finetune_df.iloc[train_idx].reset_index(drop=True)
+        fold_val_df = finetune_df.iloc[val_idx].reset_index(drop=True)
 
         # 데이터셋 구성 (source에 따라 data_dir 결정)
         train_samples = []
@@ -424,6 +539,15 @@ def finetune(args):
 
         train_ds = FlexibleDualViewDataset(train_samples, get_train_transforms(img_size))
         val_ds = FlexibleDualViewDataset(val_samples, get_val_transforms(img_size))
+        dev_loader = None
+        if not args.include_dev_in_finetune:
+            dev_samples = []
+            for _, row in dev_df.iterrows():
+                data_dir = os.path.join(DATA_DIR, "open", row["source"])
+                dev_samples.append((data_dir, row["id"], row["label_int"]))
+            dev_ds = FlexibleDualViewDataset(dev_samples, get_val_transforms(img_size))
+            dev_loader = DataLoader(dev_ds, batch_size=config["batch_size"],
+                                    shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
         # Weighted sampler for class imbalance
         labels_array = fold_train_df["label_int"].values
@@ -433,9 +557,9 @@ def finetune(args):
         sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
 
         train_loader = DataLoader(train_ds, batch_size=config["batch_size"],
-                                   sampler=sampler, num_workers=4, pin_memory=True)
+                       sampler=sampler, num_workers=args.num_workers, pin_memory=True)
         val_loader = DataLoader(val_ds, batch_size=config["batch_size"],
-                                 shuffle=False, num_workers=4, pin_memory=True)
+                     shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
         # 모델 생성 및 pretrained 가중치 로드
         model = build_model(args.model, pretrained=True, num_classes=2, drop_rate=0.4)
@@ -473,6 +597,7 @@ def finetune(args):
         best_logloss = float("inf")
         patience_count = 0
         start_epoch = 0
+        log_path = os.path.join(SAVE_DIR, f"{args.model}_fold{fold}_log.csv")
 
         # 체크포인트에서 이어서 학습
         fold_ckpt_path = os.path.join(SAVE_DIR, f"{args.model}_fold{fold}_ckpt.pth")
@@ -489,13 +614,44 @@ def finetune(args):
 
         for epoch in range(start_epoch, args.finetune_epochs):
             print(f"\n  Epoch {epoch + 1}/{args.finetune_epochs}")
-            train_loss = train_one_epoch(model, train_loader, criterion, optimizer,
-                                          scaler, device, use_mixup=True)
-            val_loss, val_logloss, val_acc = validate(model, val_loader, criterion, device)
+            epoch_start = time.time()
+            train_metrics = train_one_epoch(model, train_loader, criterion, optimizer,
+                                            scaler, device, use_mixup=True)
+            val_metrics = validate(model, val_loader, criterion, device)
+            dev_metrics = validate(model, dev_loader, criterion, device) if dev_loader is not None else None
             scheduler.step()
+            current_lr = optimizer.param_groups[0]["lr"]
+            improved = val_metrics["logloss"] < best_logloss
+            if improved:
+                best_logloss = val_metrics["logloss"]
 
-            print(f"    Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Val LogLoss: {val_logloss:.6f} | Val Acc: {val_acc:.4f}")
+            print_epoch_summary(
+                epoch=epoch + 1,
+                total_epochs=args.finetune_epochs,
+                lr=current_lr,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                best_logloss=best_logloss,
+                elapsed_sec=time.time() - epoch_start,
+                monitor_label="Val",
+                extra_metrics=dev_metrics,
+            )
+
+            append_log_row(log_path, {
+                "epoch": epoch + 1,
+                "lr": current_lr,
+                "train_loss": train_metrics["loss"],
+                "train_acc_non_mixup": train_metrics["acc"],
+                "mixup_batches": train_metrics["mixup_batches"],
+                "fold_val_loss": val_metrics["loss"],
+                "fold_val_logloss": val_metrics["logloss"],
+                "fold_val_acc": val_metrics["acc"],
+                "dev_loss": dev_metrics["loss"] if dev_metrics is not None else None,
+                "dev_logloss": dev_metrics["logloss"] if dev_metrics is not None else None,
+                "dev_acc": dev_metrics["acc"] if dev_metrics is not None else None,
+                "best_fold_logloss": best_logloss,
+                "epoch_time_sec": time.time() - epoch_start,
+            })
 
             # 매 에폭 체크포인트 저장 (중단 대비)
             torch.save({
@@ -508,11 +664,10 @@ def finetune(args):
                 "patience_count": patience_count,
             }, fold_ckpt_path)
 
-            if val_logloss < best_logloss:
-                best_logloss = val_logloss
+            if improved:
                 save_path = os.path.join(SAVE_DIR, f"{args.model}_fold{fold}.pth")
                 torch.save(model.state_dict(), save_path)
-                print(f"    >>> Saved best fold {fold} model (LogLoss: {val_logloss:.6f})")
+                print(f"    >>> Saved best fold {fold} model (LogLoss: {val_metrics['logloss']:.6f})")
                 patience_count = 0
             else:
                 patience_count += 1
@@ -544,6 +699,9 @@ def main():
     parser.add_argument("--max_archive_samples", type=int, default=10000)
     parser.add_argument("--max_shapestacks_samples", type=int, default=0,
                         help="0=use all")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--include_dev_in_finetune", action="store_true",
+                        help="Use dev in finetune training pool (disables honest dev holdout monitor)")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     args = parser.parse_args()
 

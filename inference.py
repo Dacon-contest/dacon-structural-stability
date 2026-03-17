@@ -211,6 +211,8 @@ def validate_on_dev(args):
     """Dev 셋으로 로컬 성능 검증"""
     from sklearn.metrics import log_loss
 
+    print("[Note] This dev score is unbiased only if the finetune models were trained without --include_dev_in_finetune.")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dev_csv = os.path.join(DATA_DIR, "open", "dev.csv")
     dev_dir = os.path.join(DATA_DIR, "open", "dev")
