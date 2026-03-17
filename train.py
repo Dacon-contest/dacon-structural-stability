@@ -190,6 +190,24 @@ def validate(model, loader, criterion, device):
     return avg_loss, logloss, accuracy
 
 
+class TransformDataset(torch.utils.data.Dataset):
+    """Dataset/Subset 래퍼: raw numpy 출력에 transform 적용"""
+
+    def __init__(self, dataset, transform):
+        self.dataset = dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        front, top, label = self.dataset[idx]
+        if self.transform:
+            front = self.transform(image=front)["image"]
+            top = self.transform(image=top)["image"]
+        return front, top, label
+
+
 class FlexibleDualViewDataset(torch.utils.data.Dataset):
     """유연한 Dual-View 데이터셋 (train+dev 혼합 가능)"""
 
@@ -247,7 +265,7 @@ def pretrain(args):
                 label_int = 1 if row["label"] == "unstable" else 0
                 open_samples.append((data_dir, row["id"], label_int))
     if open_samples:
-        open_ds = FlexibleDualViewDataset(open_samples, train_tf)
+        open_ds = FlexibleDualViewDataset(open_samples, transform=None)
         datasets_list.append(open_ds)
         print(f"  Open dataset (train+dev): {len(open_ds)} samples")
 
@@ -256,7 +274,7 @@ def pretrain(args):
     archive_dir = os.path.join(DATA_DIR, "archive")
     if os.path.exists(archive_csv):
         max_arc = args.max_archive_samples if args.max_archive_samples > 0 else None
-        archive_ds = ArchiveBlockDataset(archive_csv, archive_dir, transform=train_tf,
+        archive_ds = ArchiveBlockDataset(archive_csv, archive_dir, transform=None,
                                           max_samples=max_arc)
         datasets_list.append(archive_ds)
         print(f"  Archive dataset: {len(archive_ds)} samples")
@@ -265,7 +283,7 @@ def pretrain(args):
     shapestacks_dir = os.path.join(DATA_DIR, "shapestacks")
     if os.path.exists(shapestacks_dir):
         max_ss = args.max_shapestacks_samples if args.max_shapestacks_samples > 0 else None
-        ss_ds = ShapeStacksDataset(shapestacks_dir, transform=train_tf,
+        ss_ds = ShapeStacksDataset(shapestacks_dir, transform=None,
                                     max_samples=max_ss)
         if len(ss_ds) > 0:
             datasets_list.append(ss_ds)
@@ -278,11 +296,14 @@ def pretrain(args):
     combined = CombinedDataset(datasets_list)
     print(f"  Total pretrain samples: {len(combined)}")
 
-    # 90/10 split
+    # 90/10 split (transform 없는 상태로 분할 → 각각 다른 transform 적용)
     n = len(combined)
     n_val = max(int(n * 0.1), 100)
     n_train = n - n_val
-    train_ds, val_ds = torch.utils.data.random_split(combined, [n_train, n_val])
+    train_subset, val_subset = torch.utils.data.random_split(combined, [n_train, n_val])
+
+    train_ds = TransformDataset(train_subset, train_tf)
+    val_ds = TransformDataset(val_subset, val_tf)
 
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"],
                                shuffle=True, num_workers=4, pin_memory=True)
@@ -294,8 +315,14 @@ def pretrain(args):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["pretrain_lr"],
                                    weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, total_iters=2
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=5, T_mult=2, eta_min=1e-6
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[2]
     )
     criterion = FocalLoss(alpha=0.25, gamma=2.0)
     scaler = GradScaler('cuda')
