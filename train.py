@@ -32,8 +32,10 @@ from datasets import (
     ArchiveBlockDataset,
     ShapeStacksDataset,
     CombinedDataset,
+    apply_transform_to_crops,
     get_train_transforms,
     get_val_transforms,
+    load_video_tensor,
 )
 from models import build_model
 
@@ -77,6 +79,33 @@ def get_model_config(model_type):
         },
     }
     return configs[model_type]
+
+
+def resolve_batch_size(config, args):
+    if args.batch_size_override is not None:
+        return args.batch_size_override
+    return config["batch_size"]
+
+
+def resolve_stage_num_crops(args, stage):
+    if stage == "pretrain" and not args.allow_expensive_pretrain:
+        return 1
+    return args.num_crops
+
+
+def enable_gradient_checkpointing(model):
+    candidate_modules = [
+        getattr(model, "backbone", None),
+        getattr(model, "front_backbone", None),
+        getattr(model, "top_backbone", None),
+        getattr(model, "video_backbone", None),
+    ]
+    enabled = False
+    for module in candidate_modules:
+        if module is not None and hasattr(module, "set_grad_checkpointing"):
+            module.set_grad_checkpointing(True)
+            enabled = True
+    return enabled
 
 
 class FocalLoss(nn.Module):
@@ -151,12 +180,14 @@ def print_epoch_summary(epoch, total_epochs, lr, train_metrics, val_metrics,
         print(
             f"    Train  loss={train_metrics['loss']:.4f} | acc={train_acc:.4f} "
             f"(non-mixup {train_metrics['measured_samples']} samples) | "
-            f"mixup={train_metrics['mixup_batches']}/{train_metrics['num_batches']} batches"
+            f"mixup={train_metrics['mixup_batches']}/{train_metrics['num_batches']} batches | "
+            f"accum={train_metrics['grad_accum_steps']}"
         )
     else:
         print(
             f"    Train  loss={train_metrics['loss']:.4f} | "
-            f"mixup={train_metrics['mixup_batches']}/{train_metrics['num_batches']} batches"
+            f"mixup={train_metrics['mixup_batches']}/{train_metrics['num_batches']} batches | "
+            f"accum={train_metrics['grad_accum_steps']}"
         )
     print(
         f"    {monitor_label:<6} loss={val_metrics['loss']:.4f} | "
@@ -170,7 +201,24 @@ def print_epoch_summary(epoch, total_epochs, lr, train_metrics, val_metrics,
     print(f"    Best {monitor_label.lower()} logloss so far: {best_logloss:.4f}")
 
 
-def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_mixup=True):
+def unpack_supervised_batch(batch, device):
+    if len(batch) == 3:
+        front, top, labels = batch
+        return front.to(device), top.to(device), None, None, labels.to(device)
+    if len(batch) == 5:
+        front, top, video_frames, video_mask, labels = batch
+        return (
+            front.to(device),
+            top.to(device),
+            video_frames.to(device),
+            video_mask.to(device),
+            labels.to(device),
+        )
+    raise ValueError(f"Unexpected batch structure with {len(batch)} items")
+
+
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_mixup=True,
+                    grad_accum_steps=1):
     model.train()
     total_loss = 0.0
     processed_samples = 0
@@ -179,30 +227,34 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_mix
 
     mixup_batches = 0
     start_time = time.time()
+    optimizer.zero_grad(set_to_none=True)
 
     pbar = tqdm(loader, desc="Train", leave=False)
     for step, batch in enumerate(pbar, start=1):
-        front, top, labels = batch[0].to(device), batch[1].to(device), batch[2].to(device)
-
-        optimizer.zero_grad()
+        front, top, video_frames, video_mask, labels = unpack_supervised_batch(batch, device)
 
         mixup_applied = use_mixup and random.random() < 0.5
         if mixup_applied:
             mixup_batches += 1
             front, top, labels_a, labels_b, lam = mixup_data(front, top, labels)
             with autocast('cuda'):
-                logits = model(front, top)
+                logits = model(front, top, video_frames=video_frames, video_mask=video_mask)
                 loss = lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
         else:
             with autocast('cuda'):
-                logits = model(front, top)
+                logits = model(front, top, video_frames=video_frames, video_mask=video_mask)
                 loss = criterion(logits, labels)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        loss_for_backward = loss / grad_accum_steps
+        scaler.scale(loss_for_backward).backward()
+
+        should_step = (step % grad_accum_steps == 0) or (step == len(loader))
+        if should_step:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         total_loss += loss.item() * front.size(0)
         processed_samples += front.size(0)
@@ -215,6 +267,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_mix
             "loss": f"{loss.item():.4f}",
             "avg": f"{avg_loss:.4f}",
             "mixup": f"{mixup_batches}/{step}",
+            "accum": f"{grad_accum_steps}",
         }
         if total > 0:
             postfix["acc"] = f"{correct / total:.3f}"
@@ -228,6 +281,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_mix
         "measured_samples": total,
         "mixup_batches": mixup_batches,
         "num_batches": len(loader),
+        "grad_accum_steps": grad_accum_steps,
         "elapsed_sec": time.time() - start_time,
     }
 
@@ -242,10 +296,10 @@ def validate(model, loader, criterion, device):
     start_time = time.time()
 
     for batch in tqdm(loader, desc="Val", leave=False):
-        front, top, labels = batch[0].to(device), batch[1].to(device), batch[2].to(device)
+        front, top, video_frames, video_mask, labels = unpack_supervised_batch(batch, device)
 
         with autocast('cuda'):
-            logits = model(front, top)
+            logits = model(front, top, video_frames=video_frames, video_mask=video_mask)
             loss = criterion(logits, labels)
 
         probs = F.softmax(logits, dim=1)
@@ -272,28 +326,32 @@ def validate(model, loader, criterion, device):
 class TransformDataset(torch.utils.data.Dataset):
     """Dataset/Subset 래퍼: raw numpy 출력에 transform 적용"""
 
-    def __init__(self, dataset, transform):
+    def __init__(self, dataset, transform, num_crops=1):
         self.dataset = dataset
         self.transform = transform
+        self.num_crops = num_crops
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
         front, top, label = self.dataset[idx]
-        if self.transform:
-            front = self.transform(image=front)["image"]
-            top = self.transform(image=top)["image"]
+        front = apply_transform_to_crops(front, self.transform, self.num_crops)
+        top = apply_transform_to_crops(top, self.transform, self.num_crops)
         return front, top, label
 
 
 class FlexibleDualViewDataset(torch.utils.data.Dataset):
     """유연한 Dual-View 데이터셋 (train+dev 혼합 가능)"""
 
-    def __init__(self, samples, transform=None):
+    def __init__(self, samples, transform=None, use_video_frames=False,
+                 num_video_frames=3, num_crops=1):
         """samples: list of (data_dir, sample_id, label_int)"""
         self.samples = samples
         self.transform = transform
+        self.use_video_frames = use_video_frames
+        self.num_video_frames = num_video_frames
+        self.num_crops = num_crops
 
     def __len__(self):
         return len(self.samples)
@@ -308,9 +366,22 @@ class FlexibleDualViewDataset(torch.utils.data.Dataset):
         top = cv2.imread(os.path.join(sample_dir, "top.png"))
         top = cv2.cvtColor(top, cv2.COLOR_BGR2RGB)
 
-        if self.transform:
-            front = self.transform(image=front)["image"]
-            top = self.transform(image=top)["image"]
+        front = apply_transform_to_crops(front, self.transform, self.num_crops)
+        top = apply_transform_to_crops(top, self.transform, self.num_crops)
+
+        if self.use_video_frames:
+            video_path = os.path.join(sample_dir, "simulation.mp4")
+            video_frames = load_video_tensor(video_path, self.transform, self.num_video_frames)
+            if video_frames is None:
+                if front.dim() == 4:
+                    c, h, w = front.shape[1:]
+                else:
+                    c, h, w = front.shape
+                video_frames = torch.zeros((self.num_video_frames, c, h, w), dtype=front.dtype)
+                video_mask = torch.tensor(0.0, dtype=torch.float32)
+            else:
+                video_mask = torch.tensor(1.0, dtype=torch.float32)
+            return front, top, video_frames, video_mask, torch.tensor(label, dtype=torch.long)
 
         return front, top, torch.tensor(label, dtype=torch.long)
 
@@ -321,6 +392,8 @@ def pretrain(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = get_model_config(args.model)
     img_size = config["img_size"]
+    batch_size = resolve_batch_size(config, args)
+    stage_num_crops = resolve_stage_num_crops(args, "pretrain")
 
     print("=" * 60)
     print(f" Stage 1: PRETRAIN [{args.model}]")
@@ -344,7 +417,7 @@ def pretrain(args):
                 label_int = 1 if row["label"] == "unstable" else 0
                 open_samples.append((data_dir, row["id"], label_int))
     if open_samples:
-        open_ds = FlexibleDualViewDataset(open_samples, transform=None)
+        open_ds = FlexibleDualViewDataset(open_samples, transform=None, num_crops=1)
         datasets_list.append(open_ds)
         print(f"  Open dataset (train+dev): {len(open_ds)} samples")
 
@@ -354,7 +427,7 @@ def pretrain(args):
     if os.path.exists(archive_csv):
         max_arc = args.max_archive_samples if args.max_archive_samples > 0 else None
         archive_ds = ArchiveBlockDataset(archive_csv, archive_dir, transform=None,
-                                          max_samples=max_arc)
+                                          max_samples=max_arc, num_crops=1)
         datasets_list.append(archive_ds)
         print(f"  Archive dataset: {len(archive_ds)} samples")
 
@@ -363,7 +436,7 @@ def pretrain(args):
     if os.path.exists(shapestacks_dir):
         max_ss = args.max_shapestacks_samples if args.max_shapestacks_samples > 0 else None
         ss_ds = ShapeStacksDataset(shapestacks_dir, transform=None,
-                                    max_samples=max_ss)
+                                    max_samples=max_ss, num_crops=1)
         if len(ss_ds) > 0:
             datasets_list.append(ss_ds)
             print(f"  ShapeStacks dataset: {len(ss_ds)} samples")
@@ -375,6 +448,10 @@ def pretrain(args):
     combined = CombinedDataset(datasets_list)
     print(f"  Total pretrain samples: {len(combined)}")
     print("  Monitor target: mixed pretrain split validation (not competition dev score)")
+    if args.num_crops > 1 and stage_num_crops == 1:
+        print("  Pretrain crop policy: forcing single-crop for throughput; reserve multi-crop for finetune/inference")
+    if args.use_video_frames:
+        print("  Pretrain video policy: disabled; video frames are only practical in finetune on Dacon train samples")
 
     # 90/10 split (transform 없는 상태로 분할 → 각각 다른 transform 적용)
     n = len(combined)
@@ -382,16 +459,27 @@ def pretrain(args):
     n_train = n - n_val
     train_subset, val_subset = torch.utils.data.random_split(combined, [n_train, n_val])
 
-    train_ds = TransformDataset(train_subset, train_tf)
-    val_ds = TransformDataset(val_subset, val_tf)
+    train_ds = TransformDataset(train_subset, train_tf, num_crops=stage_num_crops)
+    val_ds = TransformDataset(val_subset, val_tf, num_crops=stage_num_crops)
 
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"],
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
                                shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=config["batch_size"],
+    val_loader = DataLoader(val_ds, batch_size=batch_size,
                              shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    model = build_model(args.model, pretrained=True, num_classes=2, drop_rate=0.3)
+    model = build_model(
+        args.model,
+        pretrained=True,
+        num_classes=2,
+        drop_rate=0.3,
+        use_video=False,
+        num_video_frames=args.num_video_frames,
+    )
+    if args.grad_checkpointing:
+        gc_enabled = enable_gradient_checkpointing(model)
+        print(f"  Gradient checkpointing: {'enabled' if gc_enabled else 'not supported'}")
     model = model.to(device)
+    print(f"  Batch size: {batch_size} | Grad accum: {args.grad_accum_steps} | Num crops: {stage_num_crops}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["pretrain_lr"],
                                    weight_decay=0.01)
@@ -427,7 +515,8 @@ def pretrain(args):
         print(f"\nEpoch {epoch + 1}/{args.pretrain_epochs}")
         epoch_start = time.time()
         train_metrics = train_one_epoch(model, train_loader, criterion, optimizer,
-                                        scaler, device, use_mixup=True)
+                                        scaler, device, use_mixup=True,
+                                        grad_accum_steps=args.grad_accum_steps)
         val_metrics = validate(model, val_loader, criterion, device)
         scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
@@ -459,6 +548,11 @@ def pretrain(args):
             "epoch_time_sec": time.time() - epoch_start,
         })
 
+        if improved:
+            save_path = os.path.join(SAVE_DIR, f"{args.model}_pretrained.pth")
+            torch.save(model.state_dict(), save_path)
+            print(f"    >>> Saved best pretrained model (LogLoss: {val_metrics['logloss']:.4f})")
+
         # 매 에폭 체크포인트 저장 (중단 대비)
         torch.save({
             "epoch": epoch,
@@ -469,11 +563,6 @@ def pretrain(args):
             "best_logloss": best_logloss,
         }, ckpt_path)
 
-        if improved:
-            save_path = os.path.join(SAVE_DIR, f"{args.model}_pretrained.pth")
-            torch.save(model.state_dict(), save_path)
-            print(f"    >>> Saved best pretrained model (LogLoss: {val_metrics['logloss']:.4f})")
-
     print(f"\n  Best pretrain LogLoss: {best_logloss:.4f}")
 
 
@@ -483,6 +572,8 @@ def finetune(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = get_model_config(args.model)
     img_size = config["img_size"]
+    batch_size = resolve_batch_size(config, args)
+    stage_num_crops = resolve_stage_num_crops(args, "finetune")
 
     print("=" * 60)
     print(f" Stage 2: FINETUNE [{args.model}] (5-Fold)")
@@ -537,16 +628,34 @@ def finetune(args):
             data_dir = os.path.join(DATA_DIR, "open", row["source"])
             val_samples.append((data_dir, row["id"], row["label_int"]))
 
-        train_ds = FlexibleDualViewDataset(train_samples, get_train_transforms(img_size))
-        val_ds = FlexibleDualViewDataset(val_samples, get_val_transforms(img_size))
+        train_ds = FlexibleDualViewDataset(
+            train_samples,
+            get_train_transforms(img_size),
+            use_video_frames=args.use_video_frames,
+            num_video_frames=args.num_video_frames,
+            num_crops=stage_num_crops,
+        )
+        val_ds = FlexibleDualViewDataset(
+            val_samples,
+            get_val_transforms(img_size),
+            use_video_frames=args.use_video_frames,
+            num_video_frames=args.num_video_frames,
+            num_crops=stage_num_crops,
+        )
         dev_loader = None
         if not args.include_dev_in_finetune:
             dev_samples = []
             for _, row in dev_df.iterrows():
                 data_dir = os.path.join(DATA_DIR, "open", row["source"])
                 dev_samples.append((data_dir, row["id"], row["label_int"]))
-            dev_ds = FlexibleDualViewDataset(dev_samples, get_val_transforms(img_size))
-            dev_loader = DataLoader(dev_ds, batch_size=config["batch_size"],
+            dev_ds = FlexibleDualViewDataset(
+                dev_samples,
+                get_val_transforms(img_size),
+                use_video_frames=args.use_video_frames,
+                num_video_frames=args.num_video_frames,
+                num_crops=stage_num_crops,
+            )
+            dev_loader = DataLoader(dev_ds, batch_size=batch_size,
                                     shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
         # Weighted sampler for class imbalance
@@ -556,19 +665,30 @@ def finetune(args):
         sample_weights = class_weights[labels_array]
         sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
 
-        train_loader = DataLoader(train_ds, batch_size=config["batch_size"],
+        train_loader = DataLoader(train_ds, batch_size=batch_size,
                        sampler=sampler, num_workers=args.num_workers, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=config["batch_size"],
+        val_loader = DataLoader(val_ds, batch_size=batch_size,
                      shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
         # 모델 생성 및 pretrained 가중치 로드
-        model = build_model(args.model, pretrained=True, num_classes=2, drop_rate=0.4)
+        model = build_model(
+            args.model,
+            pretrained=True,
+            num_classes=2,
+            drop_rate=0.4,
+            use_video=args.use_video_frames if args.model == "swinv2" else False,
+            num_video_frames=args.num_video_frames,
+        )
+        if args.grad_checkpointing:
+            gc_enabled = enable_gradient_checkpointing(model)
+            print(f"  Gradient checkpointing: {'enabled' if gc_enabled else 'not supported'}")
         pretrained_path = os.path.join(SAVE_DIR, f"{args.model}_pretrained.pth")
         if os.path.exists(pretrained_path):
             model.load_state_dict(torch.load(pretrained_path, map_location="cpu", weights_only=True),
                                   strict=False)
             print(f"  Loaded pretrained weights: {pretrained_path}")
         model = model.to(device)
+        print(f"  Batch size: {batch_size} | Grad accum: {args.grad_accum_steps} | Num crops: {stage_num_crops}")
 
         # Differential learning rate
         backbone_params = []
@@ -616,7 +736,8 @@ def finetune(args):
             print(f"\n  Epoch {epoch + 1}/{args.finetune_epochs}")
             epoch_start = time.time()
             train_metrics = train_one_epoch(model, train_loader, criterion, optimizer,
-                                            scaler, device, use_mixup=True)
+                                            scaler, device, use_mixup=True,
+                                            grad_accum_steps=args.grad_accum_steps)
             val_metrics = validate(model, val_loader, criterion, device)
             dev_metrics = validate(model, dev_loader, criterion, device) if dev_loader is not None else None
             scheduler.step()
@@ -700,6 +821,18 @@ def main():
     parser.add_argument("--max_shapestacks_samples", type=int, default=0,
                         help="0=use all")
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--batch_size_override", type=int, default=None,
+                        help="Override per-step batch size to reduce GPU memory")
+    parser.add_argument("--grad_accum_steps", type=int, default=1,
+                        help="Gradient accumulation steps to preserve effective batch size")
+    parser.add_argument("--grad_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing on supported backbones to reduce VRAM")
+    parser.add_argument("--num_crops", type=int, default=3)
+    parser.add_argument("--allow_expensive_pretrain", action="store_true",
+                        help="Allow multi-crop style expensive pretrain; default keeps pretrain single-crop for throughput")
+    parser.add_argument("--use_video_frames", action="store_true",
+                        help="Use simulation.mp4 frames when available (mainly useful for finetune on train samples)")
+    parser.add_argument("--num_video_frames", type=int, default=3)
     parser.add_argument("--include_dev_in_finetune", action="store_true",
                         help="Use dev in finetune training pool (disables honest dev holdout monitor)")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")

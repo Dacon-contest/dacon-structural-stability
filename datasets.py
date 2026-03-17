@@ -15,6 +15,59 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 
+def build_nested_crops(image, num_crops=1):
+    if num_crops <= 1:
+        return [image]
+
+    h, w = image.shape[:2]
+    crops = [image]
+    crop_specs = [0.9, 0.78, 0.66, 0.54]
+    for scale in crop_specs[: max(0, num_crops - 1)]:
+        crop_h = max(16, int(h * scale))
+        crop_w = max(16, int(w * scale))
+        start_y = max(0, (h - crop_h) // 2)
+        start_x = max(0, (w - crop_w) // 2)
+        crops.append(image[start_y:start_y + crop_h, start_x:start_x + crop_w])
+    return crops
+
+
+def apply_transform_to_crops(image, transform, num_crops=1):
+    crops = build_nested_crops(image, num_crops=num_crops)
+    if transform is None:
+        if num_crops <= 1:
+            return image
+
+        base_h, base_w = image.shape[:2]
+        transformed = []
+        for crop in crops:
+            resized = cv2.resize(crop, (base_w, base_h), interpolation=cv2.INTER_LINEAR)
+            tensor = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
+            transformed.append(tensor)
+        return torch.stack(transformed, dim=0)
+
+    transformed = []
+    for crop in crops:
+        transformed.append(transform(image=crop)["image"])
+
+    if num_crops <= 1:
+        return transformed[0]
+    return torch.stack(transformed, dim=0)
+
+
+def load_video_tensor(video_path, transform, num_video_frames=3):
+    raw_frames = extract_video_frames(video_path, num_video_frames)
+    if not raw_frames:
+        return None
+
+    if transform:
+        return torch.stack([transform(image=frame)["image"] for frame in raw_frames], dim=0)
+
+    return torch.stack([
+        torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+        for frame in raw_frames
+    ], dim=0)
+
+
 # ---------------------------------------------------------------------------
 # Augmentation 설정
 # ---------------------------------------------------------------------------
@@ -107,13 +160,14 @@ class DaconDualViewDataset(Dataset):
     """front.png + top.png를 concat하여 입력으로 사용하는 데이터셋"""
 
     def __init__(self, csv_path, data_dir, transform=None, is_test=False,
-                 use_video_frames=False, num_video_frames=3):
+                 use_video_frames=False, num_video_frames=3, num_crops=1):
         self.df = pd.read_csv(csv_path)
         self.data_dir = data_dir
         self.transform = transform
         self.is_test = is_test
         self.use_video_frames = use_video_frames
         self.num_video_frames = num_video_frames
+        self.num_crops = num_crops
 
     def __len__(self):
         return len(self.df)
@@ -129,33 +183,33 @@ class DaconDualViewDataset(Dataset):
         top = cv2.imread(os.path.join(sample_dir, "top.png"))
         top = cv2.cvtColor(top, cv2.COLOR_BGR2RGB)
 
-        if self.transform:
-            front = self.transform(image=front)["image"]
-            top = self.transform(image=top)["image"]
+        front = apply_transform_to_crops(front, self.transform, self.num_crops)
+        top = apply_transform_to_crops(top, self.transform, self.num_crops)
 
         # 비디오 프레임 사용 시
         video_frames = None
+        video_mask = None
         if self.use_video_frames:
             video_path = os.path.join(sample_dir, "simulation.mp4")
-            raw_frames = extract_video_frames(video_path, self.num_video_frames)
-            if raw_frames and self.transform:
-                video_frames = torch.stack([
-                    self.transform(image=f)["image"] for f in raw_frames
-                ])
-            elif raw_frames:
-                video_frames = torch.stack([
-                    torch.from_numpy(f).permute(2, 0, 1).float() / 255.0
-                    for f in raw_frames
-                ])
+            video_frames = load_video_tensor(video_path, self.transform, self.num_video_frames)
+            if video_frames is None:
+                if isinstance(front, torch.Tensor) and front.dim() == 4:
+                    c, h, w = front.shape[1:]
+                else:
+                    c, h, w = front.shape
+                video_frames = torch.zeros((self.num_video_frames, c, h, w), dtype=front.dtype)
+                video_mask = torch.tensor(0.0, dtype=torch.float32)
+            else:
+                video_mask = torch.tensor(1.0, dtype=torch.float32)
 
         if self.is_test:
-            if video_frames is not None:
-                return front, top, video_frames, sample_id
+            if self.use_video_frames:
+                return front, top, video_frames, video_mask, sample_id
             return front, top, sample_id
 
         label = 1 if row["label"] == "unstable" else 0
-        if video_frames is not None:
-            return front, top, video_frames, torch.tensor(label, dtype=torch.long)
+        if self.use_video_frames:
+            return front, top, video_frames, video_mask, torch.tensor(label, dtype=torch.long)
         return front, top, torch.tensor(label, dtype=torch.long)
 
 
@@ -165,13 +219,14 @@ class DaconDualViewDataset(Dataset):
 class ArchiveBlockDataset(Dataset):
     """Kaggle archive 블록 이미지 데이터셋 (pretrain용)"""
 
-    def __init__(self, csv_path, img_dir, transform=None, max_samples=None):
+    def __init__(self, csv_path, img_dir, transform=None, max_samples=None, num_crops=1):
         self.df = pd.read_csv(csv_path)
         if max_samples:
             self.df = self.df.sample(n=min(max_samples, len(self.df)),
                                      random_state=42).reset_index(drop=True)
         self.img_dir = img_dir
         self.transform = transform
+        self.num_crops = num_crops
 
     def __len__(self):
         return len(self.df)
@@ -189,8 +244,7 @@ class ArchiveBlockDataset(Dataset):
         else:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        if self.transform:
-            img = self.transform(image=img)["image"]
+        img = apply_transform_to_crops(img, self.transform, self.num_crops)
 
         return img, img, torch.tensor(label, dtype=torch.long)
 
@@ -201,9 +255,10 @@ class ArchiveBlockDataset(Dataset):
 class ShapeStacksDataset(Dataset):
     """ShapeStacks 외부 데이터셋 (pretrain & finetune용)"""
 
-    def __init__(self, data_root, split="train", transform=None, max_samples=None):
+    def __init__(self, data_root, split="train", transform=None, max_samples=None, num_crops=1):
         self.data_root = data_root
         self.transform = transform
+        self.num_crops = num_crops
         self.samples = []  # (img_path, label)
 
         # 실제 구조: data_root/shapestacks/recordings/<scenario>/*.png
@@ -264,8 +319,7 @@ class ShapeStacksDataset(Dataset):
         else:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        if self.transform:
-            img = self.transform(image=img)["image"]
+        img = apply_transform_to_crops(img, self.transform, self.num_crops)
 
         return img, img, torch.tensor(label, dtype=torch.long)
 

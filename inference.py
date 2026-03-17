@@ -21,7 +21,7 @@ from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from datasets import get_val_transforms, get_tta_transforms
+from datasets import apply_transform_to_crops, get_val_transforms, get_tta_transforms, load_video_tensor
 from models import build_model
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,10 +32,14 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 class TestDualViewDataset(Dataset):
-    def __init__(self, csv_path, data_dir, transform=None):
+    def __init__(self, csv_path, data_dir, transform=None, num_crops=1,
+                 use_video_frames=False, num_video_frames=3):
         self.df = pd.read_csv(csv_path)
         self.data_dir = data_dir
         self.transform = transform
+        self.num_crops = num_crops
+        self.use_video_frames = use_video_frames
+        self.num_video_frames = num_video_frames
 
     def __len__(self):
         return len(self.df)
@@ -50,9 +54,22 @@ class TestDualViewDataset(Dataset):
         top = cv2.imread(os.path.join(sample_dir, "top.png"))
         top = cv2.cvtColor(top, cv2.COLOR_BGR2RGB)
 
-        if self.transform:
-            front = self.transform(image=front)["image"]
-            top = self.transform(image=top)["image"]
+        front = apply_transform_to_crops(front, self.transform, self.num_crops)
+        top = apply_transform_to_crops(top, self.transform, self.num_crops)
+
+        if self.use_video_frames:
+            video_path = os.path.join(sample_dir, "simulation.mp4")
+            video_frames = load_video_tensor(video_path, self.transform, self.num_video_frames)
+            if video_frames is None:
+                if front.dim() == 4:
+                    c, h, w = front.shape[1:]
+                else:
+                    c, h, w = front.shape
+                video_frames = torch.zeros((self.num_video_frames, c, h, w), dtype=front.dtype)
+                video_mask = torch.tensor(0.0, dtype=torch.float32)
+            else:
+                video_mask = torch.tensor(1.0, dtype=torch.float32)
+            return front, top, video_frames, video_mask, sample_id
 
         return front, top, sample_id
 
@@ -68,12 +85,23 @@ def predict_single_model(model, loader, device):
     all_probs = []
     all_ids = []
 
-    for front, top, ids in tqdm(loader, desc="Predict", leave=False):
+    for batch in tqdm(loader, desc="Predict", leave=False):
+        if len(batch) == 3:
+            front, top, ids = batch
+            video_frames = None
+            video_mask = None
+        elif len(batch) == 5:
+            front, top, video_frames, video_mask, ids = batch
+            video_frames = video_frames.to(device)
+            video_mask = video_mask.to(device)
+        else:
+            raise ValueError(f"Unexpected batch structure with {len(batch)} items")
+
         front = front.to(device)
         top = top.to(device)
 
         with autocast():
-            logits = model(front, top)
+            logits = model(front, top, video_frames=video_frames, video_mask=video_mask)
         probs = F.softmax(logits, dim=1).cpu().numpy()
         all_probs.append(probs)
         all_ids.extend(ids)
@@ -82,7 +110,8 @@ def predict_single_model(model, loader, device):
 
 
 @torch.no_grad()
-def predict_with_tta(model, test_csv, test_dir, model_type, device, batch_size=8):
+def predict_with_tta(model, test_csv, test_dir, model_type, device, batch_size=8,
+                     num_crops=1, use_video_frames=False, num_video_frames=3):
     """TTA 적용 추론"""
     model.eval()
     img_size = get_model_img_size(model_type)
@@ -92,7 +121,14 @@ def predict_with_tta(model, test_csv, test_dir, model_type, device, batch_size=8
     all_ids = None
 
     for tta_tf in tta_transforms:
-        ds = TestDualViewDataset(test_csv, test_dir, transform=tta_tf)
+        ds = TestDualViewDataset(
+            test_csv,
+            test_dir,
+            transform=tta_tf,
+            num_crops=num_crops,
+            use_video_frames=use_video_frames,
+            num_video_frames=num_video_frames,
+        )
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                             num_workers=4, pin_memory=True)
         probs, ids = predict_single_model(model, loader, device)
@@ -140,16 +176,39 @@ def ensemble_predict(args):
 
         for ckpt_path in fold_paths:
             print(f"  Loading: {os.path.basename(ckpt_path)}")
-            model = build_model(model_type, pretrained=False, num_classes=2, drop_rate=0.0)
+            model = build_model(
+                model_type,
+                pretrained=False,
+                num_classes=2,
+                drop_rate=0.0,
+                use_video=args.use_video_frames if model_type == "swinv2" else False,
+                num_video_frames=args.num_video_frames,
+            )
             model = load_model_weights(model, ckpt_path, device)
             model = model.to(device)
 
             if args.tta:
-                probs, ids = predict_with_tta(model, test_csv, test_dir,
-                                               model_type, device, batch_size)
+                probs, ids = predict_with_tta(
+                    model,
+                    test_csv,
+                    test_dir,
+                    model_type,
+                    device,
+                    batch_size,
+                    num_crops=args.num_crops,
+                    use_video_frames=args.use_video_frames,
+                    num_video_frames=args.num_video_frames,
+                )
             else:
                 val_tf = get_val_transforms(img_size)
-                ds = TestDualViewDataset(test_csv, test_dir, transform=val_tf)
+                ds = TestDualViewDataset(
+                    test_csv,
+                    test_dir,
+                    transform=val_tf,
+                    num_crops=args.num_crops,
+                    use_video_frames=args.use_video_frames,
+                    num_video_frames=args.num_video_frames,
+                )
                 loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                                     num_workers=4, pin_memory=True)
                 probs, ids = predict_single_model(model, loader, device)
@@ -211,7 +270,8 @@ def validate_on_dev(args):
     """Dev 셋으로 로컬 성능 검증"""
     from sklearn.metrics import log_loss
 
-    print("[Note] This dev score is unbiased only if the finetune models were trained without --include_dev_in_finetune.")
+    print("[Note] This dev score is the best offline proxy for leaderboard score.")
+    print("[Note] It is unbiased only if the finetune models were trained without --include_dev_in_finetune.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dev_csv = os.path.join(DATA_DIR, "open", "dev.csv")
@@ -230,7 +290,14 @@ def validate_on_dev(args):
             if not os.path.exists(path):
                 continue
 
-            model = build_model(model_type, pretrained=False, num_classes=2, drop_rate=0.0)
+            model = build_model(
+                model_type,
+                pretrained=False,
+                num_classes=2,
+                drop_rate=0.0,
+                use_video=args.use_video_frames if model_type == "swinv2" else False,
+                num_video_frames=args.num_video_frames,
+            )
             model = load_model_weights(model, path, device)
             model = model.to(device)
 
@@ -254,10 +321,22 @@ def validate_on_dev(args):
                     fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
                     tp = cv2.imread(os.path.join(d, "top.png"))
                     tp = cv2.cvtColor(tp, cv2.COLOR_BGR2RGB)
-                    if self.transform:
-                        fr = self.transform(image=fr)["image"]
-                        tp = self.transform(image=tp)["image"]
+                    fr = apply_transform_to_crops(fr, self.transform, args.num_crops)
+                    tp = apply_transform_to_crops(tp, self.transform, args.num_crops)
                     label = 1 if row["label"] == "unstable" else 0
+                    if args.use_video_frames:
+                        video_path = os.path.join(d, "simulation.mp4")
+                        video_frames = load_video_tensor(video_path, self.transform, args.num_video_frames)
+                        if video_frames is None:
+                            if fr.dim() == 4:
+                                c, h, w = fr.shape[1:]
+                            else:
+                                c, h, w = fr.shape
+                            video_frames = torch.zeros((args.num_video_frames, c, h, w), dtype=fr.dtype)
+                            video_mask = torch.tensor(0.0, dtype=torch.float32)
+                        else:
+                            video_mask = torch.tensor(1.0, dtype=torch.float32)
+                        return fr, tp, video_frames, video_mask, torch.tensor(label, dtype=torch.long)
                     return fr, tp, torch.tensor(label, dtype=torch.long)
 
             ds = DevDataset(dev_df, dev_dir, val_tf)
@@ -267,9 +346,22 @@ def validate_on_dev(args):
             model.eval()
             probs_list = []
             with torch.no_grad():
-                for front, top, _ in loader:
+                for batch in loader:
+                    if len(batch) == 3:
+                        front, top, _ = batch
+                        video_frames = None
+                        video_mask = None
+                    else:
+                        front, top, video_frames, video_mask, _ = batch
+                        video_frames = video_frames.to(device)
+                        video_mask = video_mask.to(device)
                     with autocast():
-                        logits = model(front.to(device), top.to(device))
+                        logits = model(
+                            front.to(device),
+                            top.to(device),
+                            video_frames=video_frames,
+                            video_mask=video_mask,
+                        )
                     probs_list.append(F.softmax(logits, dim=1).cpu().numpy())
 
             all_predictions.append(np.concatenate(probs_list, axis=0))
@@ -281,8 +373,8 @@ def validate_on_dev(args):
         true_labels = (dev_df["label"] == "unstable").astype(int).values
         ll = log_loss(true_labels, ensemble_probs, labels=[0, 1])
         acc = (ensemble_probs.argmax(axis=1) == true_labels).mean()
-        print(f"\n  Dev LogLoss: {ll:.6f}")
-        print(f"  Dev Accuracy: {acc:.4f}")
+        print(f"\n  Competition Proxy LogLoss (dev): {ll:.6f}")
+        print(f"  Competition Proxy Accuracy (dev): {acc:.4f}")
 
 
 def main():
@@ -290,9 +382,13 @@ def main():
     parser.add_argument("--models", nargs="+", default=None,
                         choices=["efficientnet", "convnext", "swinv2"])
     parser.add_argument("--n_folds", type=int, default=5)
+    parser.add_argument("--num_crops", type=int, default=3)
     parser.add_argument("--tta", action="store_true", help="TTA 활성화")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Temperature scaling")
+    parser.add_argument("--use_video_frames", action="store_true",
+                        help="Use simulation.mp4 frames when available during dev/test-like evaluation")
+    parser.add_argument("--num_video_frames", type=int, default=3)
     parser.add_argument("--validate", action="store_true",
                         help="Dev 셋으로 로컬 성능 검증")
     args = parser.parse_args()

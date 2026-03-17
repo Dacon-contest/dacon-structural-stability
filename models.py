@@ -10,6 +10,37 @@ import torch.nn.functional as F
 import timm
 
 
+def encode_multi_crop(backbone, images):
+    if images.dim() == 5:
+        batch_size, num_crops, channels, height, width = images.shape
+        feats = backbone(images.view(batch_size * num_crops, channels, height, width))
+        feats = feats.view(batch_size, num_crops, -1)
+        return feats.mean(dim=1)
+    return backbone(images)
+
+
+def fuse_optional_video(backbone, fused, video_frames=None, video_mask=None):
+    if video_frames is None:
+        return fused
+
+    if video_mask is None:
+        valid_mask = torch.ones(video_frames.size(0), dtype=torch.bool, device=video_frames.device)
+    else:
+        valid_mask = video_mask > 0.5
+
+    if not valid_mask.any():
+        return fused
+
+    valid_frames = video_frames[valid_mask]
+    batch_size, time_steps, channels, height, width = valid_frames.shape
+    video_feats = backbone(valid_frames.view(batch_size * time_steps, channels, height, width))
+    video_feats = video_feats.view(batch_size, time_steps, -1).mean(dim=1)
+
+    fused = fused.clone()
+    fused[valid_mask] = (2.0 * fused[valid_mask] + video_feats) / 3.0
+    return fused
+
+
 # ===================================================================
 # Model A: EfficientNetV2-M Dual-View 
 # ===================================================================
@@ -21,7 +52,8 @@ class EfficientNetDualView(nn.Module):
     """
 
     def __init__(self, model_name="tf_efficientnetv2_m.in21k_ft_in1k",
-                 pretrained=True, num_classes=2, drop_rate=0.3):
+                 pretrained=True, num_classes=2, drop_rate=0.3,
+                 use_video=False, num_video_frames=3):
         super().__init__()
         self.backbone = timm.create_model(model_name, pretrained=pretrained,
                                           num_classes=0, drop_rate=drop_rate)
@@ -43,13 +75,14 @@ class EfficientNetDualView(nn.Module):
             nn.Linear(512, num_classes),
         )
 
-    def forward(self, front, top, video_frames=None):
-        f_feat = self.backbone(front)
-        t_feat = self.backbone(top)
+    def forward(self, front, top, video_frames=None, video_mask=None):
+        f_feat = encode_multi_crop(self.backbone, front)
+        t_feat = encode_multi_crop(self.backbone, top)
 
         concat = torch.cat([f_feat, t_feat], dim=1)
         gate = self.attn_gate(concat)  # (B, 2)
         fused = gate[:, 0:1] * f_feat + gate[:, 1:2] * t_feat
+        fused = fuse_optional_video(self.backbone, fused, video_frames=video_frames, video_mask=video_mask)
 
         return self.head(fused)
 
@@ -65,7 +98,8 @@ class ConvNeXtDualView(nn.Module):
     """
 
     def __init__(self, model_name="convnext_base.fb_in22k_ft_in1k",
-                 pretrained=True, num_classes=2, drop_rate=0.3):
+                 pretrained=True, num_classes=2, drop_rate=0.3,
+                 use_video=False, num_video_frames=3):
         super().__init__()
         self.front_backbone = timm.create_model(model_name, pretrained=pretrained,
                                                  num_classes=0, drop_rate=drop_rate)
@@ -88,10 +122,11 @@ class ConvNeXtDualView(nn.Module):
             nn.Linear(256, num_classes),
         )
 
-    def forward(self, front, top, video_frames=None):
-        f_feat = self.front_backbone(front)
-        t_feat = self.top_backbone(top)
+    def forward(self, front, top, video_frames=None, video_mask=None):
+        f_feat = encode_multi_crop(self.front_backbone, front)
+        t_feat = encode_multi_crop(self.top_backbone, top)
         fused = self.bilinear_proj(f_feat, t_feat)
+        fused = fuse_optional_video(self.front_backbone, fused, video_frames=video_frames, video_mask=video_mask)
         return self.head(fused)
 
 
@@ -148,20 +183,28 @@ class SwinV2DualView(nn.Module):
             nn.Linear(256, num_classes),
         )
 
-    def forward(self, front, top, video_frames=None):
-        f_feat = self.backbone(front)
-        t_feat = self.backbone(top)
+    def forward(self, front, top, video_frames=None, video_mask=None):
+        f_feat = encode_multi_crop(self.backbone, front)
+        t_feat = encode_multi_crop(self.backbone, top)
         fused = self.view_fusion(torch.cat([f_feat, t_feat], dim=1))
 
         if self.use_video and video_frames is not None:
             B, T, C, H, W = video_frames.shape
-            vid = video_frames.view(B * T, C, H, W)
-            vid_feat = self.video_backbone(vid)
-            vid_feat = vid_feat.view(B, T, -1)
-            vid_attn, _ = self.temporal_attn(vid_feat, vid_feat, vid_feat)
-            vid_pooled = vid_attn.mean(dim=1)
-            vid_proj = self.video_proj(vid_pooled)
-            fused = self.final_fusion(torch.cat([fused, vid_proj], dim=1))
+            if video_mask is None:
+                valid_mask = torch.ones(B, dtype=torch.bool, device=video_frames.device)
+            else:
+                valid_mask = video_mask > 0.5
+            if valid_mask.any():
+                valid_frames = video_frames[valid_mask]
+                Bv, T, C, H, W = valid_frames.shape
+                vid = valid_frames.view(Bv * T, C, H, W)
+                vid_feat = self.video_backbone(vid)
+                vid_feat = vid_feat.view(Bv, T, -1)
+                vid_attn, _ = self.temporal_attn(vid_feat, vid_feat, vid_feat)
+                vid_pooled = vid_attn.mean(dim=1)
+                vid_proj = self.video_proj(vid_pooled)
+                fused = fused.clone()
+                fused[valid_mask] = self.final_fusion(torch.cat([fused[valid_mask], vid_proj], dim=1))
 
         return self.head(fused)
 
