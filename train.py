@@ -341,11 +341,12 @@ def pretrain(args):
         print(f"  Gradient checkpointing: {'ON' if ok else 'N/A'}")
     model = model.to(device)
 
+    warmup_ep = min(5, max(args.pretrain_epochs // 4, 2))
     opt = torch.optim.AdamW(model.parameters(), lr=preset["pretrain_lr"], weight_decay=0.01)
-    warmup = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=2)
+    warmup = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=warmup_ep)
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=max(args.pretrain_epochs - 2, 1), eta_min=1e-6)
-    sched = torch.optim.lr_scheduler.SequentialLR(opt, [warmup, cosine], milestones=[2])
+        opt, T_max=max(args.pretrain_epochs - warmup_ep, 1), eta_min=1e-6)
+    sched = torch.optim.lr_scheduler.SequentialLR(opt, [warmup, cosine], milestones=[warmup_ep])
 
     focal = FocalLoss(0.25, 2.0)
     smooth = LabelSmoothingLoss(2, 0.05)
