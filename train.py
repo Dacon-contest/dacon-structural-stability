@@ -336,7 +336,10 @@ def pretrain(args):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
+        try:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        except (KeyError, TypeError):
+            print("  [WARN] Scheduler state incompatible, re-initializing scheduler")
         scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
         best_logloss = ckpt["best_logloss"]
@@ -480,7 +483,10 @@ def finetune(args):
             ckpt = torch.load(fold_ckpt_path, map_location=device, weights_only=False)
             model.load_state_dict(ckpt["model"])
             optimizer.load_state_dict(ckpt["optimizer"])
-            scheduler.load_state_dict(ckpt["scheduler"])
+            try:
+                scheduler.load_state_dict(ckpt["scheduler"])
+            except (KeyError, TypeError):
+                print("  [WARN] Scheduler state incompatible, re-initializing scheduler")
             scaler.load_state_dict(ckpt["scaler"])
             start_epoch = ckpt["epoch"] + 1
             best_logloss = ckpt["best_logloss"]
