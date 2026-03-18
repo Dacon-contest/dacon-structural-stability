@@ -48,7 +48,7 @@ TRAIN_PRESETS = {
     "dinov3_huge":   (4,  3e-5, 8e-5, 4),   # eff 16
     "siglip_so400m": (12, 5e-5, 1e-4, 1),   # eff 12
     "eva02_large":   (2,  5e-5, 1e-4, 8),   # eff 16
-    "dinov2_large":  (4,  5e-5, 1e-4, 4),   # eff 16
+    "dinov2_large":  (2,  5e-5, 1e-4, 4),   # eff 8
 }
 
 

@@ -184,7 +184,7 @@ def validate_on_dev(args):
 
 def main():
     p = argparse.ArgumentParser(description="추론 v2")
-    p.add_argument("--backbones", nargs="+", default=["eva02_large"], choices=get_backbone_choices())
+    p.add_argument("--backbones", nargs="+", default=["dinov2_large"], choices=get_backbone_choices())
     p.add_argument("--n_folds", type=int, default=5)
     p.add_argument("--tta", action="store_true")
     p.add_argument("--temperature", type=float, default=1.0)

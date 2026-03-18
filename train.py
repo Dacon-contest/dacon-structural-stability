@@ -553,7 +553,7 @@ def finetune(args):
 # =========================================================================
 def main():
     p = argparse.ArgumentParser(description="구조물 안정성 예측 학습 v2")
-    p.add_argument("--backbone", type=str, default="eva02_large", choices=get_backbone_choices())
+    p.add_argument("--backbone", type=str, default="dinov2_large", choices=get_backbone_choices())
     p.add_argument("--stage", type=str, default="finetune", choices=["pretrain", "finetune", "both"])
     p.add_argument("--pretrain_epochs", type=int, default=15)
     p.add_argument("--finetune_epochs", type=int, default=50)
@@ -561,7 +561,7 @@ def main():
     p.add_argument("--fold", type=int, default=None)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--batch_size_override", type=int, default=None)
     p.add_argument("--grad_accum_override", type=int, default=None)
     p.add_argument("--grad_checkpointing", action="store_true")

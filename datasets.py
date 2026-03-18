@@ -51,7 +51,7 @@ def get_train_transforms(img_size=384):
         A.CoarseDropout(
             num_holes_range=(1, 6),
             hole_height_range=(16, 40), hole_width_range=(16, 40), p=0.25),
-        A.RandomGrayscale(p=0.05),
+        A.ToGray(p=0.05),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
