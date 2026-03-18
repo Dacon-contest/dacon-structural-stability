@@ -1,8 +1,11 @@
 """
-데이터셋 모듈: Dacon 대회 데이터 + ShapeStacks + Archive 외부 데이터
+데이터셋 모듈 v2
+- 경쟁급 최대 증강 (Perspective, Grayscale, CutMix, Mixup 등)
+- ShapeStacks h=6 전용 Dual-View 페어링
+- 비디오 프레임 추출
+- Dev 3× 오버샘플 옵션
 """
 import os
-import glob
 import random
 
 import cv2
@@ -10,97 +13,51 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 
-def build_nested_crops(image, num_crops=1):
-    if num_crops <= 1:
-        return [image]
-
-    h, w = image.shape[:2]
-    crops = [image]
-    crop_specs = [0.9, 0.78, 0.66, 0.54]
-    for scale in crop_specs[: max(0, num_crops - 1)]:
-        crop_h = max(16, int(h * scale))
-        crop_w = max(16, int(w * scale))
-        start_y = max(0, (h - crop_h) // 2)
-        start_x = max(0, (w - crop_w) // 2)
-        crops.append(image[start_y:start_y + crop_h, start_x:start_x + crop_w])
-    return crops
-
-
-def apply_transform_to_crops(image, transform, num_crops=1):
-    crops = build_nested_crops(image, num_crops=num_crops)
-    if transform is None:
-        if num_crops <= 1:
-            return image
-
-        base_h, base_w = image.shape[:2]
-        transformed = []
-        for crop in crops:
-            resized = cv2.resize(crop, (base_w, base_h), interpolation=cv2.INTER_LINEAR)
-            tensor = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
-            transformed.append(tensor)
-        return torch.stack(transformed, dim=0)
-
-    transformed = []
-    for crop in crops:
-        transformed.append(transform(image=crop)["image"])
-
-    if num_crops <= 1:
-        return transformed[0]
-    return torch.stack(transformed, dim=0)
-
-
-def load_video_tensor(video_path, transform, num_video_frames=3):
-    raw_frames = extract_video_frames(video_path, num_video_frames)
-    if not raw_frames:
-        return None
-
-    if transform:
-        return torch.stack([transform(image=frame)["image"] for frame in raw_frames], dim=0)
-
-    return torch.stack([
-        torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
-        for frame in raw_frames
-    ], dim=0)
-
-
-# ---------------------------------------------------------------------------
-# Augmentation 설정
-# ---------------------------------------------------------------------------
+# =========================================================================
+# Augmentation
+# =========================================================================
 def get_train_transforms(img_size=384):
-    """학습용 강력한 augmentation (도메인 shift 대응)"""
+    """경쟁급 최대 증강"""
     return A.Compose([
-        A.Resize(img_size, img_size),
-        A.RandomResizedCrop((img_size, img_size), scale=(0.9, 1.0), ratio=(0.92, 1.08), p=0.35),
+        A.RandomResizedCrop(
+            (img_size, img_size), scale=(0.8, 1.0), ratio=(0.9, 1.1), p=1.0),
         A.HorizontalFlip(p=0.5),
-        A.Affine(translate_percent=(-0.04, 0.04), scale=(0.95, 1.05), rotate=(-8, 8), p=0.4),
+        A.Affine(
+            translate_percent=(-0.05, 0.05), scale=(0.93, 1.07),
+            rotate=(-10, 10), p=0.5),
+        A.Perspective(scale=(0.02, 0.06), p=0.3),
         A.OneOf([
-            A.RandomBrightnessContrast(brightness_limit=0.18, contrast_limit=0.18, p=1.0),
-            A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=12, val_shift_limit=12, p=1.0),
-            A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.12, hue=0.04, p=1.0),
-        ], p=0.7),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2, contrast_limit=0.2, p=1.0),
+            A.HueSaturationValue(
+                hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=15, p=1.0),
+            A.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.15, hue=0.05, p=1.0),
+        ], p=0.8),
         A.OneOf([
-            A.GaussianBlur(blur_limit=(3, 5), p=1.0),
-            A.MotionBlur(blur_limit=(3, 5), p=1.0),
-        ], p=0.15),
+            A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+            A.MotionBlur(blur_limit=(3, 7), p=1.0),
+        ], p=0.2),
         A.OneOf([
-            A.GaussNoise(std_range=(0.02, 0.08), p=1.0),
+            A.GaussNoise(std_range=(0.02, 0.10), p=1.0),
             A.ISONoise(p=1.0),
-        ], p=0.15),
-        A.RandomShadow(p=0.1),
-        A.RandomFog(fog_coef_range=(0.1, 0.3), p=0.1),
-        A.CoarseDropout(num_holes_range=(1, 4), hole_height_range=(12, 24), hole_width_range=(12, 24), p=0.15),
+        ], p=0.2),
+        A.RandomShadow(p=0.15),
+        A.RandomFog(fog_coef_range=(0.1, 0.35), p=0.1),
+        A.CoarseDropout(
+            num_holes_range=(1, 6),
+            hole_height_range=(16, 40), hole_width_range=(16, 40), p=0.25),
+        A.RandomGrayscale(p=0.05),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
 
 
 def get_val_transforms(img_size=384):
-    """검증/추론용 transform"""
     return A.Compose([
         A.Resize(img_size, img_size),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -109,32 +66,27 @@ def get_val_transforms(img_size=384):
 
 
 def get_tta_transforms(img_size=384):
-    """TTA (Test-Time Augmentation) transform 리스트"""
-    base_norm = A.Compose([
-        A.Resize(img_size, img_size),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
-    hflip = A.Compose([
-        A.Resize(img_size, img_size),
-        A.HorizontalFlip(p=1.0),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
-    bright = A.Compose([
-        A.Resize(img_size, img_size),
-        A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=1.0),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
-    return [base_norm, hflip, bright]
+    norm = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    return [
+        # 0: base
+        A.Compose([A.Resize(img_size, img_size), A.Normalize(**norm), ToTensorV2()]),
+        # 1: hflip
+        A.Compose([A.Resize(img_size, img_size), A.HorizontalFlip(p=1.0),
+                    A.Normalize(**norm), ToTensorV2()]),
+        # 2: brightness
+        A.Compose([A.Resize(img_size, img_size),
+                    A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=1.0),
+                    A.Normalize(**norm), ToTensorV2()]),
+        # 3: center crop
+        A.Compose([A.CenterCrop(int(img_size * 0.9), int(img_size * 0.9)),
+                    A.Resize(img_size, img_size), A.Normalize(**norm), ToTensorV2()]),
+    ]
 
 
-# ---------------------------------------------------------------------------
-# 시뮬레이션 비디오에서 프레임 추출
-# ---------------------------------------------------------------------------
+# =========================================================================
+# Video
+# =========================================================================
 def extract_video_frames(video_path, num_frames=5):
-    """시뮬레이션 mp4에서 균등 간격 프레임 추출"""
     frames = []
     if not os.path.exists(video_path):
         return frames
@@ -153,198 +105,216 @@ def extract_video_frames(video_path, num_frames=5):
     return frames
 
 
-# ---------------------------------------------------------------------------
-# Dacon 대회 데이터셋 (Dual-View: front + top)
-# ---------------------------------------------------------------------------
+def load_video_tensor(video_path, transform, num_frames=5):
+    frames = extract_video_frames(video_path, num_frames)
+    if not frames:
+        return None
+    if transform:
+        return torch.stack([transform(image=f)["image"] for f in frames])
+    return torch.stack([torch.from_numpy(f).permute(2, 0, 1).float() / 255.0 for f in frames])
+
+
+# =========================================================================
+# CutMix / Mixup
+# =========================================================================
+def _rand_bbox(W, H, lam):
+    cut_rat = np.sqrt(1.0 - lam)
+    cw, ch = max(1, int(W * cut_rat)), max(1, int(H * cut_rat))
+    cx, cy = np.random.randint(W), np.random.randint(H)
+    return (np.clip(cx - cw // 2, 0, W), np.clip(cy - ch // 2, 0, H),
+            np.clip(cx + cw // 2, 0, W), np.clip(cy + ch // 2, 0, H))
+
+
+def cutmix_data(front, top, labels, alpha=1.0):
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(front.size(0), device=front.device)
+    H, W = front.size(-2), front.size(-1)
+    x1, y1, x2, y2 = _rand_bbox(W, H, lam)
+    front[:, :, y1:y2, x1:x2] = front[idx, :, y1:y2, x1:x2]
+    top[:, :, y1:y2, x1:x2] = top[idx, :, y1:y2, x1:x2]
+    lam = 1.0 - (x2 - x1) * (y2 - y1) / (W * H)
+    return front, top, labels, labels[idx], lam
+
+
+def mixup_data(front, top, labels, alpha=0.4):
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    idx = torch.randperm(front.size(0), device=front.device)
+    return (lam * front + (1 - lam) * front[idx],
+            lam * top + (1 - lam) * top[idx],
+            labels, labels[idx], lam)
+
+
+# =========================================================================
+# Dacon Dual-View Dataset
+# =========================================================================
 class DaconDualViewDataset(Dataset):
-    """front.png + top.png를 concat하여 입력으로 사용하는 데이터셋"""
+    """Dacon 대회 데이터 (front + top + optional video)"""
 
-    def __init__(self, csv_path, data_dir, transform=None, is_test=False,
-                 use_video_frames=False, num_video_frames=3, num_crops=1):
-        self.df = pd.read_csv(csv_path)
-        self.data_dir = data_dir
+    def __init__(self, samples, transform=None, use_video=False, num_video_frames=5):
+        self.samples = samples   # [(data_dir, sample_id, label_int), ...]
         self.transform = transform
-        self.is_test = is_test
-        self.use_video_frames = use_video_frames
+        self.use_video = use_video
         self.num_video_frames = num_video_frames
-        self.num_crops = num_crops
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        sample_id = row["id"]
-        sample_dir = os.path.join(self.data_dir, sample_id)
-
-        # front + top 이미지 로드
-        front = cv2.imread(os.path.join(sample_dir, "front.png"))
-        front = cv2.cvtColor(front, cv2.COLOR_BGR2RGB)
-        top = cv2.imread(os.path.join(sample_dir, "top.png"))
-        top = cv2.cvtColor(top, cv2.COLOR_BGR2RGB)
-
-        front = apply_transform_to_crops(front, self.transform, self.num_crops)
-        top = apply_transform_to_crops(top, self.transform, self.num_crops)
-
-        # 비디오 프레임 사용 시
-        video_frames = None
-        video_mask = None
-        if self.use_video_frames:
-            video_path = os.path.join(sample_dir, "simulation.mp4")
-            video_frames = load_video_tensor(video_path, self.transform, self.num_video_frames)
-            if video_frames is None:
-                if isinstance(front, torch.Tensor) and front.dim() == 4:
-                    c, h, w = front.shape[1:]
-                else:
-                    c, h, w = front.shape
-                video_frames = torch.zeros((self.num_video_frames, c, h, w), dtype=front.dtype)
-                video_mask = torch.tensor(0.0, dtype=torch.float32)
-            else:
-                video_mask = torch.tensor(1.0, dtype=torch.float32)
-
-        if self.is_test:
-            if self.use_video_frames:
-                return front, top, video_frames, video_mask, sample_id
-            return front, top, sample_id
-
-        label = 1 if row["label"] == "unstable" else 0
-        if self.use_video_frames:
-            return front, top, video_frames, video_mask, torch.tensor(label, dtype=torch.long)
-        return front, top, torch.tensor(label, dtype=torch.long)
-
-
-# ---------------------------------------------------------------------------
-# Archive 블록 데이터셋 (single-view)
-# ---------------------------------------------------------------------------
-class ArchiveBlockDataset(Dataset):
-    """Kaggle archive 블록 이미지 데이터셋 (pretrain용)"""
-
-    def __init__(self, csv_path, img_dir, transform=None, max_samples=None, num_crops=1):
-        self.df = pd.read_csv(csv_path)
-        if max_samples:
-            self.df = self.df.sample(n=min(max_samples, len(self.df)),
-                                     random_state=42).reset_index(drop=True)
-        self.img_dir = img_dir
-        self.transform = transform
-        self.num_crops = num_crops
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img_id = row["id"]
-        label = row["stable"]  # 1=stable, 0=unstable
-        label = 1 - label  # 변환: 1=unstable, 0=stable (대회 기준)
-
-        img_path = os.path.join(self.img_dir, f"{img_id}.jpg")
-        img = cv2.imread(img_path)
-        if img is None:
-            img = np.zeros((384, 384, 3), dtype=np.uint8)
-        else:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-        img = apply_transform_to_crops(img, self.transform, self.num_crops)
-
-        return img, img, torch.tensor(label, dtype=torch.long)
-
-
-# ---------------------------------------------------------------------------
-# ShapeStacks 데이터셋
-# ---------------------------------------------------------------------------
-class ShapeStacksDataset(Dataset):
-    """ShapeStacks 외부 데이터셋 (pretrain & finetune용)"""
-
-    def __init__(self, data_root, split="train", transform=None, max_samples=None, num_crops=1):
-        self.data_root = data_root
-        self.transform = transform
-        self.num_crops = num_crops
-        self.samples = []  # (img_path, label)
-
-        # 실제 구조: data_root/shapestacks/recordings/<scenario>/*.png
-        inner_root = os.path.join(data_root, "shapestacks")
-        recordings_dir = os.path.join(inner_root, "recordings")
-        splits_file = os.path.join(inner_root, "splits", "default", f"{split}.txt")
-
-        if not os.path.exists(recordings_dir):
-            print(f"[WARNING] ShapeStacks recordings not found at {recordings_dir}")
-            return
-
-        # split 파일이 있으면 해당 시나리오만 사용
-        scenario_filter = None
-        if os.path.exists(splits_file):
-            with open(splits_file, "r") as f:
-                scenario_filter = set(line.strip() for line in f if line.strip())
-
-        # 시나리오 폴더 순회, 폴더명에서 라벨 파싱
-        # vcom=0 AND vpsf=0 → stable(0), otherwise unstable(1)
-        for scenario_name in os.listdir(recordings_dir):
-            scenario_path = os.path.join(recordings_dir, scenario_name)
-            if not os.path.isdir(scenario_path):
-                continue
-            if scenario_filter and scenario_name not in scenario_filter:
-                continue
-
-            # 라벨 파싱
-            label = 0  # default stable
-            parts = scenario_name.split("-")
-            for part in parts:
-                if part.startswith("vcom=") or part.startswith("vpsf="):
-                    val = int(part.split("=")[1])
-                    if val > 0:
-                        label = 1  # unstable
-                        break
-
-            # 해당 시나리오의 모든 PNG 이미지 수집 (카메라 앵글별)
-            for img_name in os.listdir(scenario_path):
-                if img_name.endswith(".png"):
-                    self.samples.append(
-                        (os.path.join(scenario_path, img_name), label)
-                    )
-
-        if max_samples and len(self.samples) > max_samples:
-            random.shuffle(self.samples)
-            self.samples = self.samples[:max_samples]
-
-        print(f"[ShapeStacks] Loaded {len(self.samples)} samples")
 
     def __len__(self):
         return len(self.samples)
 
+    def _load_img(self, path):
+        img = cv2.imread(path)
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else np.zeros((384, 384, 3), dtype=np.uint8)
+
     def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        img = cv2.imread(img_path)
-        if img is None:
-            img = np.zeros((384, 384, 3), dtype=np.uint8)
+        data_dir, sid, label = self.samples[idx]
+        d = os.path.join(data_dir, sid)
+        front = self._load_img(os.path.join(d, "front.png"))
+        top = self._load_img(os.path.join(d, "top.png"))
+
+        if self.transform:
+            front = self.transform(image=front)["image"]
+            top = self.transform(image=top)["image"]
         else:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            front = torch.from_numpy(front).permute(2, 0, 1).float() / 255.0
+            top = torch.from_numpy(top).permute(2, 0, 1).float() / 255.0
 
-        img = apply_transform_to_crops(img, self.transform, self.num_crops)
+        label_t = torch.tensor(label, dtype=torch.long)
 
-        return img, img, torch.tensor(label, dtype=torch.long)
+        if not self.use_video:
+            return front, top, label_t
+
+        vid_path = os.path.join(d, "simulation.mp4")
+        video = load_video_tensor(vid_path, self.transform, self.num_video_frames)
+        if video is None:
+            c, h, w = front.shape
+            video = torch.zeros(self.num_video_frames, c, h, w, dtype=front.dtype)
+            mask = torch.tensor(0.0)
+        else:
+            mask = torch.tensor(1.0)
+        return front, top, video, mask, label_t
 
 
-# ---------------------------------------------------------------------------
-# 합성 데이터셋 (여러 출처 결합)
-# ---------------------------------------------------------------------------
-class CombinedDataset(Dataset):
-    """여러 데이터셋을 합쳐서 하나로 사용"""
+# =========================================================================
+# ShapeStacks h=6 Dual-View Dataset (paired camera angles)
+# =========================================================================
+class ShapeStacksH6Dataset(Dataset):
+    """ShapeStacks h=6 전용 — 같은 시나리오의 두 카메라 앵글을 front/top으로 페어링"""
 
-    def __init__(self, datasets):
-        self.datasets = datasets
-        self.lengths = [len(d) for d in datasets]
-        self.cumulative = []
-        total = 0
-        for l in self.lengths:
-            self.cumulative.append(total)
-            total += l
-        self.total_len = total
+    def __init__(self, data_root, split=None, transform=None,
+                 max_samples=None, pairs_per_scenario=4):
+        self.transform = transform
+        self.scenarios = []       # [(label, [img_path, ...]), ...]
+        self.pairs_per = pairs_per_scenario
+
+        inner = os.path.join(data_root, "shapestacks")
+        rec_dir = os.path.join(inner, "recordings")
+
+        if not os.path.exists(rec_dir):
+            print(f"[WARN] ShapeStacks recordings not found: {rec_dir}")
+            return
+
+        scenario_filter = None
+        if split:
+            sf = os.path.join(inner, "splits", "default", f"{split}.txt")
+            if os.path.exists(sf):
+                with open(sf) as f:
+                    scenario_filter = set(l.strip() for l in f if l.strip())
+
+        for name in sorted(os.listdir(rec_dir)):
+            if "h=6" not in name:
+                continue
+            path = os.path.join(rec_dir, name)
+            if not os.path.isdir(path):
+                continue
+            if scenario_filter and name not in scenario_filter:
+                continue
+
+            label = 0
+            for p in name.split("-"):
+                if p.startswith("vcom=") or p.startswith("vpsf="):
+                    if int(p.split("=")[1]) > 0:
+                        label = 1
+                        break
+
+            imgs = sorted(os.path.join(path, f) for f in os.listdir(path) if f.endswith(".png"))
+            if len(imgs) >= 2:
+                self.scenarios.append((label, imgs))
+
+        if max_samples and len(self.scenarios) > max_samples:
+            random.shuffle(self.scenarios)
+            self.scenarios = self.scenarios[:max_samples]
+
+        stable = sum(1 for l, _ in self.scenarios if l == 0)
+        unstable = len(self.scenarios) - stable
+        print(f"[ShapeStacks h=6] {len(self.scenarios)} scenarios × {self.pairs_per} "
+              f"= {len(self)} items  (stable={stable}, unstable={unstable})")
 
     def __len__(self):
-        return self.total_len
+        return len(self.scenarios) * self.pairs_per
+
+    def _load_img(self, path):
+        img = cv2.imread(path)
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else np.zeros((224, 224, 3), dtype=np.uint8)
 
     def __getitem__(self, idx):
-        for i, (start, length) in enumerate(zip(self.cumulative, self.lengths)):
-            if idx < start + length:
-                return self.datasets[i][idx - start]
-        raise IndexError(f"Index {idx} out of range")
+        sc_idx = idx % len(self.scenarios)
+        label, imgs = self.scenarios[sc_idx]
+        i, j = random.sample(range(len(imgs)), 2)
+        front = self._load_img(imgs[i])
+        top = self._load_img(imgs[j])
+
+        if self.transform:
+            front = self.transform(image=front)["image"]
+            top = self.transform(image=top)["image"]
+        else:
+            front = torch.from_numpy(front).permute(2, 0, 1).float() / 255.0
+            top = torch.from_numpy(top).permute(2, 0, 1).float() / 255.0
+
+        return front, top, torch.tensor(label, dtype=torch.long)
+
+
+# =========================================================================
+# Test Dataset
+# =========================================================================
+class TestDataset(Dataset):
+    def __init__(self, csv_path, data_dir, transform=None):
+        self.df = pd.read_csv(csv_path)
+        self.data_dir = data_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        sid = self.df.iloc[idx]["id"]
+        d = os.path.join(self.data_dir, sid)
+        front = cv2.cvtColor(cv2.imread(os.path.join(d, "front.png")), cv2.COLOR_BGR2RGB)
+        top = cv2.cvtColor(cv2.imread(os.path.join(d, "top.png")), cv2.COLOR_BGR2RGB)
+        if self.transform:
+            front = self.transform(image=front)["image"]
+            top = self.transform(image=top)["image"]
+        else:
+            front = torch.from_numpy(front).permute(2, 0, 1).float() / 255.0
+            top = torch.from_numpy(top).permute(2, 0, 1).float() / 255.0
+        return front, top, sid
+
+
+# =========================================================================
+# Combined Dataset
+# =========================================================================
+class CombinedDataset(Dataset):
+    def __init__(self, datasets):
+        self.datasets = datasets
+        self.cumlen = []
+        total = 0
+        for d in datasets:
+            self.cumlen.append(total)
+            total += len(d)
+        self.total = total
+
+    def __len__(self):
+        return self.total
+
+    def __getitem__(self, idx):
+        for start, ds in zip(self.cumlen, self.datasets):
+            if idx < start + len(ds):
+                return ds[idx - start]
+        raise IndexError(idx)

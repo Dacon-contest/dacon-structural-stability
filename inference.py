@@ -1,13 +1,9 @@
 """
-추론 및 앙상블 스크립트
-- 3개 모델 x 5-Fold = 15개 체크포인트 앙상블
-- TTA (Test-Time Augmentation) 적용
-- 최종 submission.csv 생성
+추론 v2: 멀티 백본 앙상블 + TTA + Temperature Calibration
 
-사용법:
-  python inference.py                           # 전체 앙상블
-  python inference.py --model efficientnet       # 단일 모델
-  python inference.py --tta                      # TTA 활성화
+Usage:
+  python inference.py --backbones eva_giant dinov3_huge --tta
+  python inference.py --backbones eva02_large --tta --validate
 """
 import argparse
 import os
@@ -17,12 +13,12 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from datasets import apply_transform_to_crops, get_val_transforms, get_tta_transforms, load_video_tensor
-from models import build_model
+from datasets import get_val_transforms, get_tta_transforms, load_video_tensor
+from models import build_model, get_backbone_config, get_train_preset, get_backbone_choices
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -31,119 +27,50 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "submissions")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-class TestDualViewDataset(Dataset):
-    def __init__(self, csv_path, data_dir, transform=None, num_crops=1,
-                 use_video_frames=False, num_video_frames=3):
+class InferDataset(Dataset):
+    def __init__(self, csv_path, data_dir, transform):
         self.df = pd.read_csv(csv_path)
         self.data_dir = data_dir
         self.transform = transform
-        self.num_crops = num_crops
-        self.use_video_frames = use_video_frames
-        self.num_video_frames = num_video_frames
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        sample_id = row["id"]
-        sample_dir = os.path.join(self.data_dir, sample_id)
-
-        front = cv2.imread(os.path.join(sample_dir, "front.png"))
-        front = cv2.cvtColor(front, cv2.COLOR_BGR2RGB)
-        top = cv2.imread(os.path.join(sample_dir, "top.png"))
-        top = cv2.cvtColor(top, cv2.COLOR_BGR2RGB)
-
-        front = apply_transform_to_crops(front, self.transform, self.num_crops)
-        top = apply_transform_to_crops(top, self.transform, self.num_crops)
-
-        if self.use_video_frames:
-            video_path = os.path.join(sample_dir, "simulation.mp4")
-            video_frames = load_video_tensor(video_path, self.transform, self.num_video_frames)
-            if video_frames is None:
-                if front.dim() == 4:
-                    c, h, w = front.shape[1:]
-                else:
-                    c, h, w = front.shape
-                video_frames = torch.zeros((self.num_video_frames, c, h, w), dtype=front.dtype)
-                video_mask = torch.tensor(0.0, dtype=torch.float32)
-            else:
-                video_mask = torch.tensor(1.0, dtype=torch.float32)
-            return front, top, video_frames, video_mask, sample_id
-
-        return front, top, sample_id
-
-
-def get_model_img_size(model_type):
-    sizes = {"efficientnet": 384, "convnext": 384, "swinv2": 256}
-    return sizes[model_type]
+        sid = self.df.iloc[idx]["id"]
+        d = os.path.join(self.data_dir, sid)
+        fr = cv2.cvtColor(cv2.imread(os.path.join(d, "front.png")), cv2.COLOR_BGR2RGB)
+        tp = cv2.cvtColor(cv2.imread(os.path.join(d, "top.png")), cv2.COLOR_BGR2RGB)
+        fr = self.transform(image=fr)["image"]
+        tp = self.transform(image=tp)["image"]
+        return fr, tp, sid
 
 
 @torch.no_grad()
-def predict_single_model(model, loader, device):
+def predict(model, loader, device):
     model.eval()
-    all_probs = []
-    all_ids = []
-
-    for batch in tqdm(loader, desc="Predict", leave=False):
-        if len(batch) == 3:
-            front, top, ids = batch
-            video_frames = None
-            video_mask = None
-        elif len(batch) == 5:
-            front, top, video_frames, video_mask, ids = batch
-            video_frames = video_frames.to(device)
-            video_mask = video_mask.to(device)
-        else:
-            raise ValueError(f"Unexpected batch structure with {len(batch)} items")
-
-        front = front.to(device)
-        top = top.to(device)
-
-        with autocast():
-            logits = model(front, top, video_frames=video_frames, video_mask=video_mask)
-        probs = F.softmax(logits, dim=1).cpu().numpy()
-        all_probs.append(probs)
+    all_probs, all_ids = [], []
+    for fr, tp, ids in tqdm(loader, desc="Predict", leave=False):
+        with autocast("cuda"):
+            logits = model(fr.to(device), tp.to(device))
+        all_probs.append(F.softmax(logits.float(), dim=1).cpu().numpy())
         all_ids.extend(ids)
-
-    return np.concatenate(all_probs, axis=0), all_ids
+    return np.concatenate(all_probs), all_ids
 
 
 @torch.no_grad()
-def predict_with_tta(model, test_csv, test_dir, model_type, device, batch_size=8,
-                     num_crops=1, use_video_frames=False, num_video_frames=3):
-    """TTA 적용 추론"""
+def predict_tta(model, csv_path, data_dir, img_size, device, bs=8):
     model.eval()
-    img_size = get_model_img_size(model_type)
-    tta_transforms = get_tta_transforms(img_size)
-
-    all_probs_list = []
-    all_ids = None
-
-    for tta_tf in tta_transforms:
-        ds = TestDualViewDataset(
-            test_csv,
-            test_dir,
-            transform=tta_tf,
-            num_crops=num_crops,
-            use_video_frames=use_video_frames,
-            num_video_frames=num_video_frames,
-        )
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                            num_workers=4, pin_memory=True)
-        probs, ids = predict_single_model(model, loader, device)
-        all_probs_list.append(probs)
+    tta_tfs = get_tta_transforms(img_size)
+    all_probs, all_ids = [], None
+    for tf in tta_tfs:
+        ds = InferDataset(csv_path, data_dir, tf)
+        loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=4, pin_memory=True)
+        probs, ids = predict(model, loader, device)
+        all_probs.append(probs)
         if all_ids is None:
             all_ids = ids
-
-    avg_probs = np.mean(all_probs_list, axis=0)
-    return avg_probs, all_ids
-
-
-def load_model_weights(model, checkpoint_path, device):
-    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model.load_state_dict(state_dict, strict=False)
-    return model
+    return np.mean(all_probs, axis=0), all_ids
 
 
 def ensemble_predict(args):
@@ -151,247 +78,118 @@ def ensemble_predict(args):
     test_csv = os.path.join(DATA_DIR, "open", "sample_submission.csv")
     test_dir = os.path.join(DATA_DIR, "open", "test")
 
-    models_to_use = args.models if args.models else ["efficientnet", "convnext", "swinv2"]
-    all_predictions = []
+    all_preds = []
+    for bk in args.backbones:
+        cfg = get_backbone_config(bk)
+        img_size = cfg["img_size"]
+        preset = get_train_preset(bk)
+        bs = preset["batch_size"] * 2  # inference can use larger batch
 
-    for model_type in models_to_use:
-        img_size = get_model_img_size(model_type)
-        config = {"efficientnet": 8, "convnext": 4, "swinv2": 8}
-        batch_size = config.get(model_type, 8)
-
-        # K-Fold 체크포인트 수집
-        fold_paths = []
         for fold in range(args.n_folds):
-            path = os.path.join(SAVE_DIR, f"{model_type}_fold{fold}.pth")
-            if os.path.exists(path):
-                fold_paths.append(path)
-
-        if not fold_paths:
-            print(f"[WARN] No checkpoints for {model_type}, skipping.")
-            continue
-
-        print(f"\n{'=' * 40}")
-        print(f" {model_type}: {len(fold_paths)} fold(s)")
-        print(f"{'=' * 40}")
-
-        for ckpt_path in fold_paths:
-            print(f"  Loading: {os.path.basename(ckpt_path)}")
-            model = build_model(
-                model_type,
-                pretrained=False,
-                num_classes=2,
-                drop_rate=0.0,
-                use_video=args.use_video_frames if model_type == "swinv2" else False,
-                num_video_frames=args.num_video_frames,
-            )
-            model = load_model_weights(model, ckpt_path, device)
+            path = os.path.join(SAVE_DIR, f"{bk}_fold{fold}.pth")
+            if not os.path.exists(path):
+                continue
+            print(f"  Loading {bk} fold {fold}")
+            model = build_model(bk, pretrained=False, num_classes=2, drop_rate=0.0)
+            model.load_state_dict(torch.load(path, map_location=device, weights_only=True), strict=False)
             model = model.to(device)
 
             if args.tta:
-                probs, ids = predict_with_tta(
-                    model,
-                    test_csv,
-                    test_dir,
-                    model_type,
-                    device,
-                    batch_size,
-                    num_crops=args.num_crops,
-                    use_video_frames=args.use_video_frames,
-                    num_video_frames=args.num_video_frames,
-                )
+                probs, ids = predict_tta(model, test_csv, test_dir, img_size, device, bs)
             else:
-                val_tf = get_val_transforms(img_size)
-                ds = TestDualViewDataset(
-                    test_csv,
-                    test_dir,
-                    transform=val_tf,
-                    num_crops=args.num_crops,
-                    use_video_frames=args.use_video_frames,
-                    num_video_frames=args.num_video_frames,
-                )
-                loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                                    num_workers=4, pin_memory=True)
-                probs, ids = predict_single_model(model, loader, device)
+                tf = get_val_transforms(img_size)
+                ds = InferDataset(test_csv, test_dir, tf)
+                loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=4, pin_memory=True)
+                probs, ids = predict(model, loader, device)
 
-            all_predictions.append(probs)
+            all_preds.append(probs)
             del model
             torch.cuda.empty_cache()
 
-    if not all_predictions:
-        print("[ERROR] No predictions generated!")
+    if not all_preds:
+        print("[ERROR] No predictions!")
         return
 
-    # 앙상블 (평균)
-    ensemble_probs = np.mean(all_predictions, axis=0)
+    ens = np.mean(all_preds, axis=0)
 
-    # Temperature scaling (캘리브레이션)
+    # Temperature scaling
     if args.temperature != 1.0:
-        logits = np.log(ensemble_probs + 1e-10)
-        logits /= args.temperature
-        exp_logits = np.exp(logits)
-        ensemble_probs = exp_logits / exp_logits.sum(axis=1, keepdims=True)
+        logits = np.log(ens + 1e-10) / args.temperature
+        e = np.exp(logits)
+        ens = e / e.sum(axis=1, keepdims=True)
 
-    # Submission 생성
-    sub_df = pd.read_csv(test_csv)
-    sub_df["unstable_prob"] = ensemble_probs[:, 1]  # class 1 = unstable
-    sub_df["stable_prob"] = ensemble_probs[:, 0]    # class 0 = stable
-
-    # Probability normalization
-    row_sums = sub_df[["unstable_prob", "stable_prob"]].sum(axis=1)
-    sub_df["unstable_prob"] /= row_sums
-    sub_df["stable_prob"] /= row_sums
-
-    # Clipping for numerical stability
+    # Build submission
+    sub = pd.read_csv(test_csv)
     eps = 1e-7
-    sub_df["unstable_prob"] = sub_df["unstable_prob"].clip(eps, 1 - eps)
-    sub_df["stable_prob"] = sub_df["stable_prob"].clip(eps, 1 - eps)
+    sub["unstable_prob"] = np.clip(ens[:, 1], eps, 1 - eps)
+    sub["stable_prob"] = np.clip(ens[:, 0], eps, 1 - eps)
+    row_sum = sub["unstable_prob"] + sub["stable_prob"]
+    sub["unstable_prob"] /= row_sum
+    sub["stable_prob"] /= row_sum
 
-    output_name = f"submission_{'_'.join(models_to_use)}"
+    name = f"submission_{'_'.join(args.backbones)}"
     if args.tta:
-        output_name += "_tta"
-    output_path = os.path.join(OUTPUT_DIR, f"{output_name}.csv")
-    sub_df[["id", "unstable_prob", "stable_prob"]].to_csv(output_path, index=False)
+        name += "_tta"
+    out = os.path.join(OUTPUT_DIR, f"{name}.csv")
+    sub[["id", "unstable_prob", "stable_prob"]].to_csv(out, index=False)
 
-    print(f"\n{'=' * 60}")
-    print(f"  Submission saved: {output_path}")
-    print(f"  Models used: {models_to_use}")
-    print(f"  Total predictions ensembled: {len(all_predictions)}")
-    print(f"  TTA: {args.tta}")
-    print(f"{'=' * 60}")
-
-    # 통계 출력
-    print(f"\n  unstable_prob: mean={sub_df['unstable_prob'].mean():.4f}, "
-          f"std={sub_df['unstable_prob'].std():.4f}")
-    print(f"  stable_prob:   mean={sub_df['stable_prob'].mean():.4f}, "
-          f"std={sub_df['stable_prob'].std():.4f}")
+    print(f"\n  Saved: {out}")
+    print(f"  Models: {args.backbones} × {len(all_preds)} checkpoints")
+    print(f"  TTA: {args.tta} | Temp: {args.temperature}")
+    print(f"  unstable_prob: mean={sub['unstable_prob'].mean():.4f} std={sub['unstable_prob'].std():.4f}")
 
 
 def validate_on_dev(args):
-    """Dev 셋으로 로컬 성능 검증"""
-    from sklearn.metrics import log_loss
-
-    print("[Note] This dev score is the best offline proxy for leaderboard score.")
-    print("[Note] It is unbiased only if the finetune models were trained without --include_dev_in_finetune.")
-
+    from sklearn.metrics import log_loss as sk_logloss
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dev_csv = os.path.join(DATA_DIR, "open", "dev.csv")
     dev_dir = os.path.join(DATA_DIR, "open", "dev")
     dev_df = pd.read_csv(dev_csv)
 
-    models_to_use = args.models if args.models else ["efficientnet", "convnext", "swinv2"]
-    all_predictions = []
-
-    for model_type in models_to_use:
-        img_size = get_model_img_size(model_type)
-        batch_size = {"efficientnet": 8, "convnext": 4, "swinv2": 8}.get(model_type, 8)
-
+    all_preds = []
+    for bk in args.backbones:
+        cfg = get_backbone_config(bk)
+        img_size = cfg["img_size"]
         for fold in range(args.n_folds):
-            path = os.path.join(SAVE_DIR, f"{model_type}_fold{fold}.pth")
+            path = os.path.join(SAVE_DIR, f"{bk}_fold{fold}.pth")
             if not os.path.exists(path):
                 continue
-
-            model = build_model(
-                model_type,
-                pretrained=False,
-                num_classes=2,
-                drop_rate=0.0,
-                use_video=args.use_video_frames if model_type == "swinv2" else False,
-                num_video_frames=args.num_video_frames,
-            )
-            model = load_model_weights(model, path, device)
+            model = build_model(bk, pretrained=False, num_classes=2, drop_rate=0.0)
+            model.load_state_dict(torch.load(path, map_location=device, weights_only=True), strict=False)
             model = model.to(device)
 
-            # dev.csv를 사용해서 추론
-            val_tf = get_val_transforms(img_size)
-
-            class DevDataset(Dataset):
-                def __init__(self, df, data_dir, transform):
-                    self.df = df
-                    self.data_dir = data_dir
-                    self.transform = transform
-
-                def __len__(self):
-                    return len(self.df)
-
-                def __getitem__(self, idx):
-                    row = self.df.iloc[idx]
-                    sid = row["id"]
-                    d = os.path.join(self.data_dir, sid)
-                    fr = cv2.imread(os.path.join(d, "front.png"))
-                    fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
-                    tp = cv2.imread(os.path.join(d, "top.png"))
-                    tp = cv2.cvtColor(tp, cv2.COLOR_BGR2RGB)
-                    fr = apply_transform_to_crops(fr, self.transform, args.num_crops)
-                    tp = apply_transform_to_crops(tp, self.transform, args.num_crops)
-                    label = 1 if row["label"] == "unstable" else 0
-                    if args.use_video_frames:
-                        video_path = os.path.join(d, "simulation.mp4")
-                        video_frames = load_video_tensor(video_path, self.transform, args.num_video_frames)
-                        if video_frames is None:
-                            if fr.dim() == 4:
-                                c, h, w = fr.shape[1:]
-                            else:
-                                c, h, w = fr.shape
-                            video_frames = torch.zeros((args.num_video_frames, c, h, w), dtype=fr.dtype)
-                            video_mask = torch.tensor(0.0, dtype=torch.float32)
-                        else:
-                            video_mask = torch.tensor(1.0, dtype=torch.float32)
-                        return fr, tp, video_frames, video_mask, torch.tensor(label, dtype=torch.long)
-                    return fr, tp, torch.tensor(label, dtype=torch.long)
-
-            ds = DevDataset(dev_df, dev_dir, val_tf)
-            loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                                num_workers=4, pin_memory=True)
-
-            model.eval()
-            probs_list = []
-            with torch.no_grad():
-                for batch in loader:
-                    if len(batch) == 3:
-                        front, top, _ = batch
-                        video_frames = None
-                        video_mask = None
-                    else:
-                        front, top, video_frames, video_mask, _ = batch
-                        video_frames = video_frames.to(device)
-                        video_mask = video_mask.to(device)
-                    with autocast():
-                        logits = model(
-                            front.to(device),
-                            top.to(device),
-                            video_frames=video_frames,
-                            video_mask=video_mask,
-                        )
-                    probs_list.append(F.softmax(logits, dim=1).cpu().numpy())
-
-            all_predictions.append(np.concatenate(probs_list, axis=0))
+            if args.tta:
+                probs, _ = predict_tta(model, dev_csv, dev_dir, img_size, device)
+            else:
+                tf = get_val_transforms(img_size)
+                ds = InferDataset(dev_csv, dev_dir, tf)
+                loader = DataLoader(ds, batch_size=8, shuffle=False, num_workers=4, pin_memory=True)
+                probs, _ = predict(model, loader, device)
+            all_preds.append(probs)
             del model
             torch.cuda.empty_cache()
 
-    if all_predictions:
-        ensemble_probs = np.mean(all_predictions, axis=0)
-        true_labels = (dev_df["label"] == "unstable").astype(int).values
-        ll = log_loss(true_labels, ensemble_probs, labels=[0, 1])
-        acc = (ensemble_probs.argmax(axis=1) == true_labels).mean()
-        print(f"\n  Competition Proxy LogLoss (dev): {ll:.6f}")
-        print(f"  Competition Proxy Accuracy (dev): {acc:.4f}")
+    if not all_preds:
+        print("[ERROR] No checkpoints!")
+        return
+
+    ens = np.mean(all_preds, axis=0)
+    true = (dev_df["label"] == "unstable").astype(int).values
+    ll = sk_logloss(true, ens, labels=[0, 1])
+    acc = (ens.argmax(1) == true).mean()
+    print(f"\n  Dev LogLoss: {ll:.6f}")
+    print(f"  Dev Accuracy: {acc:.4f}")
+    print(f"  Ensembled: {len(all_preds)} checkpoints")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="구조물 안정성 예측 추론")
-    parser.add_argument("--models", nargs="+", default=None,
-                        choices=["efficientnet", "convnext", "swinv2"])
-    parser.add_argument("--n_folds", type=int, default=5)
-    parser.add_argument("--num_crops", type=int, default=3)
-    parser.add_argument("--tta", action="store_true", help="TTA 활성화")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                        help="Temperature scaling")
-    parser.add_argument("--use_video_frames", action="store_true",
-                        help="Use simulation.mp4 frames when available during dev/test-like evaluation")
-    parser.add_argument("--num_video_frames", type=int, default=3)
-    parser.add_argument("--validate", action="store_true",
-                        help="Dev 셋으로 로컬 성능 검증")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="추론 v2")
+    p.add_argument("--backbones", nargs="+", default=["eva02_large"], choices=get_backbone_choices())
+    p.add_argument("--n_folds", type=int, default=5)
+    p.add_argument("--tta", action="store_true")
+    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--validate", action="store_true", help="Dev set 검증")
+    args = p.parse_args()
 
     if args.validate:
         validate_on_dev(args)

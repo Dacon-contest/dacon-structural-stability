@@ -1,116 +1,85 @@
 """
-모델 모듈: 3가지 고성능 아키텍처
-- Model A: EfficientNetV2-M Dual-View Fusion
-- Model B: ConvNeXt-Base Dual-View Fusion
-- Model C: SwinV2-Small Dual-View + 선택적 비디오 프레임 활용
+모델 모듈 v2: 대규모 ViT 기반 Dual-View 구조물 안정성 예측
+
+지원 백본:
+  [A100 Tier — Colab]
+  - eva_giant     : EVA-Giant      (1.0B, 336px) — ImageNet #1급
+  - dinov3_huge   : DINOv3 ViT-H+  (840M, 384px) — 자기지도 SOTA, 공간 구조 최강
+  - siglip_so400m : SigLIP SO400M  (428M, 384px) — 대비학습 SOTA
+  [Local — 12GB GPU]
+  - eva02_large   : EVA02-Large    (305M, 448px) — 상위 솔루션 검증
+  - dinov2_large  : DINOv2 ViT-L   (304M, 336px) — 공간 구조 특화
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import timm
 
+BACKBONE_CONFIGS = {
+    "eva_giant": {
+        "timm_name": "eva_giant_patch14_336.m30m_ft_in22k_in1k",
+        "img_size": 336,
+        "tier": "a100",
+    },
+    "dinov3_huge": {
+        "timm_name": "vit_huge_plus_patch16_dinov3.lvd1689m",
+        "img_size": 384,
+        "tier": "a100",
+    },
+    "siglip_so400m": {
+        "timm_name": "vit_so400m_patch14_siglip_384.webli",
+        "img_size": 384,
+        "tier": "a100",
+    },
+    "eva02_large": {
+        "timm_name": "eva02_large_patch14_448.mim_m38m_ft_in22k_in1k",
+        "img_size": 448,
+        "tier": "local",
+    },
+    "dinov2_large": {
+        "timm_name": "vit_large_patch14_reg4_dinov2.lvd142m",
+        "img_size": 336,
+        "tier": "local",
+    },
+}
 
-def encode_multi_crop(backbone, images):
-    if images.dim() == 5:
-        batch_size, num_crops, channels, height, width = images.shape
-        feats = backbone(images.view(batch_size * num_crops, channels, height, width))
-        feats = feats.view(batch_size, num_crops, -1)
-        return feats.mean(dim=1)
-    return backbone(images)
+TRAIN_PRESETS = {
+    # backbone_key: (batch_size, lr, pretrain_lr, grad_accum)  effective_bs = batch * accum
+    "eva_giant":     (6,  3e-5, 8e-5, 2),   # eff 12
+    "dinov3_huge":   (4,  3e-5, 8e-5, 4),   # eff 16
+    "siglip_so400m": (12, 5e-5, 1e-4, 1),   # eff 12
+    "eva02_large":   (2,  5e-5, 1e-4, 8),   # eff 16
+    "dinov2_large":  (4,  5e-5, 1e-4, 4),   # eff 16
+}
 
 
-def fuse_optional_video(backbone, fused, video_frames=None, video_mask=None):
-    if video_frames is None:
-        return fused
+class DualViewModel(nn.Module):
+    """공유 백본 → Attention Gate Fusion → MLP Head"""
 
-    if video_mask is None:
-        valid_mask = torch.ones(video_frames.size(0), dtype=torch.bool, device=video_frames.device)
-    else:
-        valid_mask = video_mask > 0.5
-
-    if not valid_mask.any():
-        return fused
-
-    valid_frames = video_frames[valid_mask]
-    batch_size, time_steps, channels, height, width = valid_frames.shape
-    video_feats = backbone(valid_frames.view(batch_size * time_steps, channels, height, width))
-    video_feats = video_feats.view(batch_size, time_steps, -1).mean(dim=1)
-
-    fused = fused.clone()
-    fused[valid_mask] = (2.0 * fused[valid_mask] + video_feats) / 3.0
-    return fused
-
-
-# ===================================================================
-# Model A: EfficientNetV2-M Dual-View 
-# ===================================================================
-class EfficientNetDualView(nn.Module):
-    """
-    EfficientNetV2-M 기반 Dual-View 모델
-    - front, top 이미지를 각각 인코딩 후 Attention Fusion
-    - 5060 RTX 16GB에서 batch_size=8 가능
-    """
-
-    def __init__(self, model_name="tf_efficientnetv2_m.in21k_ft_in1k",
-                 pretrained=True, num_classes=2, drop_rate=0.3,
-                 use_video=False, num_video_frames=3):
+    def __init__(self, backbone_key="eva02_large", pretrained=True,
+                 num_classes=2, drop_rate=0.3,
+                 use_video=False, num_video_frames=5):
         super().__init__()
-        self.backbone = timm.create_model(model_name, pretrained=pretrained,
-                                          num_classes=0, drop_rate=drop_rate)
-        feat_dim = self.backbone.num_features
+        cfg = BACKBONE_CONFIGS[backbone_key]
+        self.backbone_key = backbone_key
+        self.use_video = use_video
 
-        # Cross-view attention fusion
+        self.backbone = timm.create_model(
+            cfg["timm_name"],
+            pretrained=pretrained,
+            num_classes=0,
+            drop_rate=drop_rate,
+            img_size=cfg["img_size"],
+        )
+        feat_dim = self.backbone.num_features
+        self.feat_dim = feat_dim
+
         self.attn_gate = nn.Sequential(
             nn.Linear(feat_dim * 2, feat_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(feat_dim, 2),
             nn.Softmax(dim=1),
         )
 
-        self.head = nn.Sequential(
-            nn.Linear(feat_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(drop_rate),
-            nn.Linear(512, num_classes),
-        )
-
-    def forward(self, front, top, video_frames=None, video_mask=None):
-        f_feat = encode_multi_crop(self.backbone, front)
-        t_feat = encode_multi_crop(self.backbone, top)
-
-        concat = torch.cat([f_feat, t_feat], dim=1)
-        gate = self.attn_gate(concat)  # (B, 2)
-        fused = gate[:, 0:1] * f_feat + gate[:, 1:2] * t_feat
-        fused = fuse_optional_video(self.backbone, fused, video_frames=video_frames, video_mask=video_mask)
-
-        return self.head(fused)
-
-
-# ===================================================================
-# Model B: ConvNeXt-Base Dual-View
-# ===================================================================
-class ConvNeXtDualView(nn.Module):
-    """
-    ConvNeXt-Base 기반 Dual-View 모델
-    - Bidirectional feature fusion
-    - 5060 RTX 16GB에서 batch_size=4~6 가능
-    """
-
-    def __init__(self, model_name="convnext_base.fb_in22k_ft_in1k",
-                 pretrained=True, num_classes=2, drop_rate=0.3,
-                 use_video=False, num_video_frames=3):
-        super().__init__()
-        self.front_backbone = timm.create_model(model_name, pretrained=pretrained,
-                                                 num_classes=0, drop_rate=drop_rate)
-        self.top_backbone = timm.create_model(model_name, pretrained=pretrained,
-                                               num_classes=0, drop_rate=drop_rate)
-        feat_dim = self.front_backbone.num_features
-
-        # Bilinear fusion
-        self.bilinear_proj = nn.Bilinear(feat_dim, feat_dim, feat_dim)
-
-        # Multi-head classification
         self.head = nn.Sequential(
             nn.LayerNorm(feat_dim),
             nn.Linear(feat_dim, 512),
@@ -122,104 +91,56 @@ class ConvNeXtDualView(nn.Module):
             nn.Linear(256, num_classes),
         )
 
-    def forward(self, front, top, video_frames=None, video_mask=None):
-        f_feat = encode_multi_crop(self.front_backbone, front)
-        t_feat = encode_multi_crop(self.top_backbone, top)
-        fused = self.bilinear_proj(f_feat, t_feat)
-        fused = fuse_optional_video(self.front_backbone, fused, video_frames=video_frames, video_mask=video_mask)
-        return self.head(fused)
-
-
-# ===================================================================
-# Model C: SwinV2-Small Dual-View + Optional Video Frame Aggregation
-# ===================================================================
-class SwinV2DualView(nn.Module):
-    """
-    SwinV2-Small 기반 Dual-View + 시뮬레이션 비디오 프레임 활용
-    - front+top: SwinV2로 인코딩
-    - video frames: 추가 temporal feature (학습 데이터에만 mp4 존재)
-    - 5060 RTX 16GB에서 batch_size=4~8 가능
-    """
-
-    def __init__(self, model_name="swinv2_small_window16_256.ms_in1k",
-                 pretrained=True, num_classes=2, drop_rate=0.3,
-                 use_video=False, num_video_frames=3):
-        super().__init__()
-        self.use_video = use_video
-
-        self.backbone = timm.create_model(model_name, pretrained=pretrained,
-                                          num_classes=0, drop_rate=drop_rate)
-        feat_dim = self.backbone.num_features
-
-        # Dual-view concat + projection
-        self.view_fusion = nn.Sequential(
-            nn.Linear(feat_dim * 2, feat_dim),
-            nn.LayerNorm(feat_dim),
-            nn.GELU(),
-            nn.Dropout(drop_rate * 0.5),
-        )
-
-        # Video temporal aggregation (optional)
-        if use_video:
-            self.video_backbone = timm.create_model(model_name, pretrained=pretrained,
-                                                     num_classes=0, drop_rate=drop_rate)
-            self.temporal_attn = nn.MultiheadAttention(feat_dim, num_heads=8, batch_first=True)
-            self.video_proj = nn.Sequential(
-                nn.Linear(feat_dim, feat_dim),
-                nn.LayerNorm(feat_dim),
-                nn.GELU(),
-            )
-            self.final_fusion = nn.Sequential(
-                nn.Linear(feat_dim * 2, feat_dim),
-                nn.LayerNorm(feat_dim),
-                nn.GELU(),
-                nn.Dropout(drop_rate),
-            )
-
-        self.head = nn.Sequential(
-            nn.Linear(feat_dim, 256),
-            nn.GELU(),
-            nn.Dropout(drop_rate),
-            nn.Linear(256, num_classes),
-        )
+    def encode(self, images):
+        if images.dim() == 5:
+            B, N, C, H, W = images.shape
+            feats = self.backbone(images.view(B * N, C, H, W))
+            return feats.view(B, N, -1).mean(dim=1)
+        return self.backbone(images)
 
     def forward(self, front, top, video_frames=None, video_mask=None):
-        f_feat = encode_multi_crop(self.backbone, front)
-        t_feat = encode_multi_crop(self.backbone, top)
-        fused = self.view_fusion(torch.cat([f_feat, t_feat], dim=1))
+        f = self.encode(front)
+        t = self.encode(top)
+        gate = self.attn_gate(torch.cat([f, t], dim=1))
+        fused = gate[:, 0:1] * f + gate[:, 1:2] * t
 
         if self.use_video and video_frames is not None:
-            B, T, C, H, W = video_frames.shape
-            if video_mask is None:
-                valid_mask = torch.ones(B, dtype=torch.bool, device=video_frames.device)
-            else:
-                valid_mask = video_mask > 0.5
-            if valid_mask.any():
-                valid_frames = video_frames[valid_mask]
-                Bv, T, C, H, W = valid_frames.shape
-                vid = valid_frames.view(Bv * T, C, H, W)
-                vid_feat = self.video_backbone(vid)
-                vid_feat = vid_feat.view(Bv, T, -1)
-                vid_attn, _ = self.temporal_attn(vid_feat, vid_feat, vid_feat)
-                vid_pooled = vid_attn.mean(dim=1)
-                vid_proj = self.video_proj(vid_pooled)
-                fused = fused.clone()
-                fused[valid_mask] = self.final_fusion(torch.cat([fused[valid_mask], vid_proj], dim=1))
-
+            fused = self._fuse_video(fused, video_frames, video_mask)
         return self.head(fused)
 
+    def _fuse_video(self, fused, video_frames, video_mask):
+        valid = video_mask > 0.5 if video_mask is not None else torch.ones(
+            video_frames.size(0), dtype=torch.bool, device=fused.device)
+        if not valid.any():
+            return fused
+        vf = video_frames[valid]
+        B, T, C, H, W = vf.shape
+        vid = self.backbone(vf.view(B * T, C, H, W)).view(B, T, -1).mean(dim=1)
+        out = fused.clone()
+        out[valid] = 0.7 * fused[valid] + 0.3 * vid
+        return out
 
-# ===================================================================
-# Model Factory
-# ===================================================================
-MODEL_REGISTRY = {
-    "efficientnet": EfficientNetDualView,
-    "convnext": ConvNeXtDualView,
-    "swinv2": SwinV2DualView,
-}
+
+def build_model(backbone_key, **kwargs):
+    return DualViewModel(backbone_key=backbone_key, **kwargs)
 
 
-def build_model(model_type="efficientnet", **kwargs):
-    if model_type not in MODEL_REGISTRY:
-        raise ValueError(f"Unknown model: {model_type}. Choose from {list(MODEL_REGISTRY.keys())}")
-    return MODEL_REGISTRY[model_type](**kwargs)
+def get_backbone_config(key):
+    return BACKBONE_CONFIGS[key]
+
+
+def get_train_preset(key):
+    bs, lr, plr, ga = TRAIN_PRESETS[key]
+    return {"batch_size": bs, "lr": lr, "pretrain_lr": plr, "grad_accum": ga}
+
+
+def get_backbone_choices():
+    return list(BACKBONE_CONFIGS.keys())
+
+
+def enable_gradient_checkpointing(model):
+    bb = model.backbone
+    if hasattr(bb, "set_grad_checkpointing"):
+        bb.set_grad_checkpointing(True)
+        return True
+    return False
