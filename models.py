@@ -44,11 +44,11 @@ BACKBONE_CONFIGS = {
 
 TRAIN_PRESETS = {
     # backbone_key: (batch_size, lr, pretrain_lr, grad_accum)  effective_bs = batch * accum
-    "eva_giant":     (6,  3e-5, 3e-5, 2),   # eff 12
-    "dinov3_huge":   (4,  3e-5, 3e-5, 4),   # eff 16
-    "siglip_so400m": (12, 5e-5, 4e-5, 1),   # eff 12
-    "eva02_large":   (2,  5e-5, 4e-5, 8),   # eff 16
-    "dinov2_large":  (2,  5e-5, 4e-5, 4),   # eff 8
+    "eva_giant":     (6,  3e-5, 1e-5, 4),   # eff 24
+    "dinov3_huge":   (4,  3e-5, 1e-5, 8),   # eff 32
+    "siglip_so400m": (12, 5e-5, 2e-5, 2),   # eff 24
+    "eva02_large":   (2,  5e-5, 1e-5, 16),  # eff 32
+    "dinov2_large":  (2,  5e-5, 1e-5, 16),  # eff 32
 }
 
 

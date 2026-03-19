@@ -342,7 +342,7 @@ def pretrain(args):
     model = model.to(device)
 
     warmup_ep = min(5, max(args.pretrain_epochs // 4, 2))
-    opt = torch.optim.AdamW(model.parameters(), lr=preset["pretrain_lr"], weight_decay=0.01)
+    opt = torch.optim.AdamW(model.parameters(), lr=preset["pretrain_lr"], weight_decay=0.05)
     warmup = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=warmup_ep)
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=max(args.pretrain_epochs - warmup_ep, 1), eta_min=1e-6)
@@ -464,17 +464,21 @@ def finetune(args):
             enable_gradient_checkpointing(model)
 
         pt_path = os.path.join(SAVE_DIR, f"{args.backbone}_pretrained.pth")
-        if os.path.exists(pt_path):
+        has_pretrained = os.path.exists(pt_path)
+        if has_pretrained:
             model.load_state_dict(torch.load(pt_path, map_location="cpu", weights_only=True), strict=False)
             print(f"  Loaded pretrained: {pt_path}")
+        else:
+            print(f"  No pretrained ckpt — using ImageNet weights (backbone LR ×0.3)")
         model = model.to(device)
 
-        # Differential LR
+        # Differential LR: pretrained 없으면 backbone LR 배율 높임
+        bb_lr_scale = 0.1 if has_pretrained else 0.3
         bb_params, head_params = [], []
         for name, p in model.named_parameters():
             (head_params if any(k in name for k in ["head", "attn_gate"]) else bb_params).append(p)
         opt = torch.optim.AdamW([
-            {"params": bb_params, "lr": preset["lr"] * 0.1},
+            {"params": bb_params, "lr": preset["lr"] * bb_lr_scale},
             {"params": head_params, "lr": preset["lr"]},
         ], weight_decay=0.02)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.finetune_epochs, eta_min=1e-7)
