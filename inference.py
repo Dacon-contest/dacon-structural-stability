@@ -20,6 +20,9 @@ from tqdm import tqdm
 from datasets import get_val_transforms, get_tta_transforms, load_video_tensor
 from models import build_model, get_backbone_config, get_train_preset, get_backbone_choices
 
+import torch.multiprocessing as _mp
+_mp.set_sharing_strategy("file_system")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 SAVE_DIR = os.path.join(BASE_DIR, "checkpoints")

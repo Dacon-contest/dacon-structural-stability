@@ -52,10 +52,17 @@ from models import (
     enable_gradient_checkpointing,
 )
 
+import torch.multiprocessing as _mp
+_mp.set_sharing_strategy("file_system")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 SAVE_DIR = os.path.join(BASE_DIR, "checkpoints")
 os.makedirs(SAVE_DIR, exist_ok=True)
+
+# Resume ckpt → 로컬(빠르고 디스크 절약), best model → SAVE_DIR(Drive)
+LOCAL_CKPT_DIR = os.environ.get("DACON_LOCAL_CKPT", SAVE_DIR)
+os.makedirs(LOCAL_CKPT_DIR, exist_ok=True)
 
 
 def set_seed(seed=42):
@@ -355,7 +362,10 @@ def pretrain(args):
 
     best_ll = float("inf")
     start_ep = 0
-    ckpt_path = os.path.join(SAVE_DIR, f"{args.backbone}_pretrain_ckpt.pth")
+    ckpt_path = os.path.join(LOCAL_CKPT_DIR, f"{args.backbone}_pretrain_ckpt.pth")
+    ckpt_path_fallback = os.path.join(SAVE_DIR, f"{args.backbone}_pretrain_ckpt.pth")
+    if args.resume and not os.path.exists(ckpt_path) and os.path.exists(ckpt_path_fallback):
+        ckpt_path = ckpt_path_fallback
     if args.resume and os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ck["model"])
@@ -429,6 +439,16 @@ def finetune(args):
         if args.fold is not None and fold != args.fold:
             continue
 
+        ckpt_path = os.path.join(LOCAL_CKPT_DIR, f"{args.backbone}_fold{fold}_ckpt.pth")
+        ckpt_fallback = os.path.join(SAVE_DIR, f"{args.backbone}_fold{fold}_ckpt.pth")
+        best_path = os.path.join(SAVE_DIR, f"{args.backbone}_fold{fold}.pth")
+
+        if args.skip_completed and os.path.exists(best_path) \
+                and not os.path.exists(ckpt_path) and not os.path.exists(ckpt_fallback):
+            print(f"  Fold {fold} 이미 완료 (best 모델 존재) → 건너뜀")
+            fold_results.append(None)
+            continue
+
         print(f"\n{'='*40}  Fold {fold+1}/{args.n_folds}  {'='*40}")
         trn = [all_samples[i] for i in trn_idx]
         val = [all_samples[i] for i in val_idx]
@@ -490,7 +510,8 @@ def finetune(args):
         patience_cnt = 0
         start_ep = 0
         log_path = os.path.join(SAVE_DIR, f"{args.backbone}_fold{fold}_log.csv")
-        ckpt_path = os.path.join(SAVE_DIR, f"{args.backbone}_fold{fold}_ckpt.pth")
+        if not os.path.exists(ckpt_path) and os.path.exists(ckpt_fallback):
+            ckpt_path = ckpt_fallback
 
         if args.resume and os.path.exists(ckpt_path):
             ck = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -544,12 +565,19 @@ def finetune(args):
                     print(f"    Early stop at ep {ep+1}")
                     break
 
+        # 완료된 fold의 resume ckpt 삭제 (디스크 절약)
+        local_ckpt = os.path.join(LOCAL_CKPT_DIR, f"{args.backbone}_fold{fold}_ckpt.pth")
+        if os.path.exists(local_ckpt):
+            os.remove(local_ckpt)
+            print(f"  Resume ckpt 삭제: {local_ckpt}")
+
         fold_results.append(best_ll)
         print(f"  Fold {fold} Best: {best_ll:.6f}")
 
-    if fold_results:
+    valid_results = [r for r in fold_results if r is not None]
+    if valid_results:
         print(f"\n{'='*60}")
-        print(f"  CV Mean LogLoss: {np.mean(fold_results):.6f} ± {np.std(fold_results):.6f}")
+        print(f"  CV Mean LogLoss: {np.mean(valid_results):.6f} ± {np.std(valid_results):.6f}")
         print(f"{'='*60}")
 
 
@@ -575,6 +603,8 @@ def main():
     p.add_argument("--include_dev", action="store_true",
                    help="Dev를 학습 풀에 포함 (3× oversample)")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--skip_completed", action="store_true",
+                   help="이미 best 모델이 있고 resume ckpt 없는 fold 건너뛰기")
     args = p.parse_args()
 
     print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
