@@ -40,6 +40,7 @@ from datasets import (
     ShapeStacksH6Dataset,
     CombinedDataset,
     get_train_transforms,
+    get_train_transforms_simple,
     get_val_transforms,
     cutmix_data,
     mixup_data,
@@ -147,7 +148,7 @@ def unpack_batch(batch, device):
 # =========================================================================
 # Train / Validate
 # =========================================================================
-def train_one_epoch(model, loader, focal, smooth, optimizer, scaler, device,
+def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device,
                     use_augmix=True, grad_accum=1):
     model.train()
     tot_loss, n_samples, correct, total = 0.0, 0, 0, 0
@@ -182,10 +183,9 @@ def train_one_epoch(model, loader, focal, smooth, optimizer, scaler, device,
             continue
 
         if aug_type != "clean":
-            loss = lam * combined_loss(logits, la, focal, smooth) + \
-                   (1 - lam) * combined_loss(logits, lb, focal, smooth)
+            loss = lam * loss_fn(logits, la) + (1 - lam) * loss_fn(logits, lb)
         else:
-            loss = combined_loss(logits, labels, focal, smooth)
+            loss = loss_fn(logits, labels)
 
         if not torch.isfinite(loss):
             n_skip += 1
@@ -218,7 +218,7 @@ def train_one_epoch(model, loader, focal, smooth, optimizer, scaler, device,
 
 
 @torch.no_grad()
-def validate(model, loader, focal, smooth, device):
+def validate(model, loader, loss_fn, device):
     model.eval()
     probs_list, labels_list = [], []
     tot_loss, total = 0.0, 0
@@ -226,7 +226,7 @@ def validate(model, loader, focal, smooth, device):
     for batch in tqdm(loader, desc="Val", leave=False):
         front, top, vf, vm, labels = unpack_batch(batch, device)
         logits = model(front, top, video_frames=vf, video_mask=vm).float()
-        loss = combined_loss(logits, labels, focal, smooth)
+        loss = loss_fn(logits, labels)
         probs = F.softmax(logits, dim=1)
         probs_list.append(probs.cpu().numpy())
         labels_list.append(labels.cpu().numpy())
@@ -357,6 +357,7 @@ def pretrain(args):
 
     focal = FocalLoss(0.25, 2.0)
     smooth = LabelSmoothingLoss(2, 0.05)
+    loss_fn = lambda logits, targets: combined_loss(logits, targets, focal, smooth)
     scaler = GradScaler("cuda")
     log_path = os.path.join(SAVE_DIR, f"{args.backbone}_pretrain_log.csv")
 
@@ -378,9 +379,9 @@ def pretrain(args):
 
     for ep in range(start_ep, args.pretrain_epochs):
         t0 = time.time()
-        tm = train_one_epoch(model, train_loader, focal, smooth, opt, scaler, device,
+        tm = train_one_epoch(model, train_loader, loss_fn, opt, scaler, device,
                              use_augmix=True, grad_accum=ga)
-        vm = validate(model, val_loader, focal, smooth, device)
+        vm = validate(model, val_loader, loss_fn, device)
         sched.step()
         lr = opt.param_groups[0]["lr"]
         improved = vm["logloss"] < best_ll
@@ -417,20 +418,48 @@ def finetune(args):
     img_size = cfg["img_size"]
     bs = args.batch_size_override or preset["batch_size"]
     ga = args.grad_accum_override or preset["grad_accum"]
+    drop = args.drop_rate if args.drop_rate is not None else 0.3
+    wd = args.weight_decay
+
+    # LR 결정: CLI 우선 → preset 기본값
+    head_lr = args.head_lr if args.head_lr else preset["lr"]
+    bb_lr = args.bb_lr if args.bb_lr else preset["lr"]
 
     print("=" * 60)
     print(f"  FINETUNE [{args.backbone}] 5-Fold  img={img_size}  bs={bs}  accum={ga}")
+    print(f"  Loss={args.loss} | Mixup={'OFF' if args.no_mixup else 'ON'} | "
+          f"Sched={args.scheduler} | Head={args.head_type}")
+    print(f"  head_lr={head_lr:.1e} | bb_lr={bb_lr:.1e} | wd={wd} | drop={drop}")
+    if args.merge_dev:
+        print(f"  ★ merge_dev: train+dev 합쳐서 K-Fold (1등 전략)")
     print("=" * 60)
 
-    # 샘플 목록
-    all_samples = build_dacon_samples(DATA_DIR, include_dev=args.include_dev,
-                                       dev_oversample=3 if args.include_dev else 1)
-    dev_samples = [] if args.include_dev else build_dev_samples(DATA_DIR)
+    # 데이터 전략 결정
+    if args.merge_dev:
+        # 1등 전략: train+dev 전체 합침 → K-Fold
+        all_samples = build_dacon_samples(DATA_DIR, include_dev=True, dev_oversample=1)
+        dev_samples = []
+        dev_aug_samples = []
+    else:
+        all_samples = build_dacon_samples(DATA_DIR, include_dev=args.include_dev,
+                                           dev_oversample=3 if args.include_dev else 1)
+        dev_samples = [] if args.include_dev else build_dev_samples(DATA_DIR)
+        dev_aug_samples = []
+        if args.include_dev_aug and not args.include_dev:
+            dev_aug_samples = build_dev_samples(DATA_DIR) * args.dev_aug_repeat
+            print(f"  Dev augment-only: {len(dev_aug_samples)} (×{args.dev_aug_repeat} oversample)")
 
     labels_arr = np.array([s[2] for s in all_samples])
     print(f"  Pool: {len(all_samples)} (stable={sum(labels_arr==0)}, unstable={sum(labels_arr==1)})")
     if dev_samples:
         print(f"  Dev holdout: {len(dev_samples)}")
+
+    # 증강 선택
+    if args.simple_aug:
+        train_tf = get_train_transforms_simple(img_size)
+        print(f"  Augmentation: simple (1등 스타일)")
+    else:
+        train_tf = get_train_transforms(img_size)
 
     skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
     fold_results = []
@@ -453,20 +482,31 @@ def finetune(args):
         trn = [all_samples[i] for i in trn_idx]
         val = [all_samples[i] for i in val_idx]
 
-        train_ds = DaconDualViewDataset(trn, get_train_transforms(img_size),
+        # dev 증강 학습: fold split 후 train에만 추가 (val 오염 없음)
+        if dev_aug_samples:
+            trn = trn + dev_aug_samples
+            print(f"  Train: {len(trn)} (원본 {len(trn)-len(dev_aug_samples)} + dev_aug {len(dev_aug_samples)})")
+
+        train_ds = DaconDualViewDataset(trn, train_tf,
                                          use_video=args.use_video, num_video_frames=args.num_video_frames)
         val_ds = DaconDualViewDataset(val, get_val_transforms(img_size),
                                        use_video=args.use_video, num_video_frames=args.num_video_frames)
 
-        # Weighted sampler
+        # merge_dev + 균형 데이터면 shuffle, 아니면 WeightedRandomSampler
         trn_labels = np.array([s[2] for s in trn])
         counts = np.bincount(trn_labels)
-        wts = 1.0 / counts
-        sw = wts[trn_labels]
-        sampler = WeightedRandomSampler(sw, len(sw), replacement=True)
+        is_balanced = len(counts) == 2 and abs(counts[0] - counts[1]) / max(counts) < 0.1
 
-        train_loader = DataLoader(train_ds, batch_size=bs, sampler=sampler,
-                                  num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        if is_balanced or args.merge_dev:
+            train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
+                                      num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        else:
+            wts = 1.0 / counts
+            sw = wts[trn_labels]
+            sampler = WeightedRandomSampler(sw, len(sw), replacement=True)
+            train_loader = DataLoader(train_ds, batch_size=bs, sampler=sampler,
+                                      num_workers=args.num_workers, pin_memory=True, drop_last=True)
+
         val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False,
                                 num_workers=args.num_workers, pin_memory=True)
         dev_loader = None
@@ -476,34 +516,55 @@ def finetune(args):
             dev_loader = DataLoader(dev_ds, batch_size=bs, shuffle=False,
                                     num_workers=args.num_workers, pin_memory=True)
 
-        # Model
+        # Model (head_type 지원)
         model = build_model(args.backbone, pretrained=True, num_classes=2,
-                            drop_rate=0.4, use_video=args.use_video,
-                            num_video_frames=args.num_video_frames)
+                            drop_rate=drop, use_video=args.use_video,
+                            num_video_frames=args.num_video_frames,
+                            head_type=args.head_type)
         if args.grad_checkpointing:
             enable_gradient_checkpointing(model)
 
         pt_path = os.path.join(SAVE_DIR, f"{args.backbone}_pretrained.pth")
         has_pretrained = os.path.exists(pt_path)
         if has_pretrained:
-            model.load_state_dict(torch.load(pt_path, map_location="cpu", weights_only=True), strict=False)
-            print(f"  Loaded pretrained: {pt_path}")
+            saved = torch.load(pt_path, map_location="cpu", weights_only=True)
+            # head/attn_gate 크기가 다를 수 있으므로 backbone만 로드
+            model_sd = model.state_dict()
+            filtered = {k: v for k, v in saved.items()
+                        if k in model_sd and v.shape == model_sd[k].shape}
+            skipped = set(saved.keys()) - set(filtered.keys())
+            model.load_state_dict(filtered, strict=False)
+            print(f"  Loaded pretrained: {pt_path} ({len(filtered)} params, skipped {len(skipped)})")
         else:
-            print(f"  No pretrained ckpt — using ImageNet weights (backbone LR ×0.3)")
+            print(f"  No pretrained ckpt — using ImageNet weights")
         model = model.to(device)
 
-        # Differential LR: pretrained 없으면 backbone LR 배율 높임
-        bb_lr_scale = 0.1 if has_pretrained else 0.3
+        # Differential LR
+        bb_lr_scale = 0.1 if has_pretrained else 1.0
         bb_params, head_params = [], []
         for name, p in model.named_parameters():
             (head_params if any(k in name for k in ["head", "attn_gate"]) else bb_params).append(p)
         opt = torch.optim.AdamW([
-            {"params": bb_params, "lr": preset["lr"] * bb_lr_scale},
-            {"params": head_params, "lr": preset["lr"]},
-        ], weight_decay=0.02)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.finetune_epochs, eta_min=1e-7)
-        focal = FocalLoss(0.3, 2.0)
-        smooth = LabelSmoothingLoss(2, 0.05)
+            {"params": bb_params, "lr": bb_lr * bb_lr_scale},
+            {"params": head_params, "lr": head_lr},
+        ], weight_decay=wd)
+
+        # Scheduler
+        if args.scheduler == "cosine_wr":
+            sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                opt, T_0=10, T_mult=2)
+        else:
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=args.finetune_epochs, eta_min=1e-7)
+
+        # Loss
+        if args.loss == "ce":
+            loss_fn = nn.CrossEntropyLoss()
+        else:
+            focal = FocalLoss(0.3, 2.0)
+            smooth = LabelSmoothingLoss(2, 0.05)
+            loss_fn = lambda logits, targets: combined_loss(logits, targets, focal, smooth)
+
         scaler = GradScaler("cuda")
 
         best_ll = float("inf")
@@ -526,10 +587,10 @@ def finetune(args):
 
         for ep in range(start_ep, args.finetune_epochs):
             t0 = time.time()
-            tm = train_one_epoch(model, train_loader, focal, smooth, opt, scaler, device,
-                                 use_augmix=True, grad_accum=ga)
-            vm = validate(model, val_loader, focal, smooth, device)
-            dm = validate(model, dev_loader, focal, smooth, device) if dev_loader else None
+            tm = train_one_epoch(model, train_loader, loss_fn, opt, scaler, device,
+                                 use_augmix=not args.no_mixup, grad_accum=ga)
+            vm = validate(model, val_loader, loss_fn, device)
+            dm = validate(model, dev_loader, loss_fn, device) if dev_loader else None
             sched.step()
             lr = opt.param_groups[0]["lr"]
             improved = vm["logloss"] < best_ll
@@ -585,11 +646,11 @@ def finetune(args):
 # CLI
 # =========================================================================
 def main():
-    p = argparse.ArgumentParser(description="구조물 안정성 예측 학습 v2")
+    p = argparse.ArgumentParser(description="구조물 안정성 예측 학습 v3")
     p.add_argument("--backbone", type=str, default="dinov2_large", choices=get_backbone_choices())
     p.add_argument("--stage", type=str, default="finetune", choices=["pretrain", "finetune", "both"])
     p.add_argument("--pretrain_epochs", type=int, default=15)
-    p.add_argument("--finetune_epochs", type=int, default=50)
+    p.add_argument("--finetune_epochs", type=int, default=30)
     p.add_argument("--n_folds", type=int, default=5)
     p.add_argument("--fold", type=int, default=None)
     p.add_argument("--patience", type=int, default=10)
@@ -601,7 +662,33 @@ def main():
     p.add_argument("--use_video", action="store_true")
     p.add_argument("--num_video_frames", type=int, default=5)
     p.add_argument("--include_dev", action="store_true",
-                   help="Dev를 학습 풀에 포함 (3× oversample)")
+                   help="Dev를 학습 풀에 포함 (3× oversample, val fold에도 섞임)")
+    p.add_argument("--include_dev_aug", action="store_true",
+                   help="Dev를 증강해서 train에만 추가 (val fold 오염 없음)")
+    p.add_argument("--dev_aug_repeat", type=int, default=3,
+                   help="dev_aug oversample 횟수 (기본 3×)")
+    p.add_argument("--merge_dev", action="store_true",
+                   help="★ 1등 전략: train+dev 합쳐서 K-Fold (1100개 전체 활용)")
+    p.add_argument("--loss", type=str, default="ce", choices=["ce", "focal"],
+                   help="Loss 함수 (ce: CrossEntropy, focal: Focal+LabelSmoothing)")
+    p.add_argument("--no_mixup", action="store_true",
+                   help="Mixup/CutMix 비활성화 (1등 전략)")
+    p.add_argument("--head_lr", type=float, default=None,
+                   help="Head LR 직접 지정 (미지정 시 preset 사용)")
+    p.add_argument("--bb_lr", type=float, default=None,
+                   help="Backbone LR 직접 지정 (미지정 시 preset 사용)")
+    p.add_argument("--weight_decay", type=float, default=0.01,
+                   help="Weight decay (기본 0.01)")
+    p.add_argument("--scheduler", type=str, default="cosine",
+                   choices=["cosine", "cosine_wr"],
+                   help="스케줄러 (cosine_wr: WarmRestarts T0=10)")
+    p.add_argument("--head_type", type=str, default="simple",
+                   choices=["attn_gate", "simple"],
+                   help="Head 구조 (simple: 1등 스타일 concat+MLP)")
+    p.add_argument("--drop_rate", type=float, default=None,
+                   help="Dropout rate (미지정 시 0.3)")
+    p.add_argument("--simple_aug", action="store_true",
+                   help="단순 증강 사용 (1등 스타일)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--skip_completed", action="store_true",
                    help="이미 best 모델이 있고 resume ckpt 없는 fold 건너뛰기")

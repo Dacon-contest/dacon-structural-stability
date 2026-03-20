@@ -53,15 +53,21 @@ TRAIN_PRESETS = {
 
 
 class DualViewModel(nn.Module):
-    """공유 백본 → Attention Gate Fusion → MLP Head"""
+    """공유 백본 → Fusion → MLP Head
+    head_type:
+      - "attn_gate": Attention Gate Fusion → deep MLP (기존)
+      - "simple":    Concat → BN+MLP (1등 솔루션 스타일, 더 단순)
+    """
 
     def __init__(self, backbone_key="eva02_large", pretrained=True,
                  num_classes=2, drop_rate=0.3,
-                 use_video=False, num_video_frames=5):
+                 use_video=False, num_video_frames=5,
+                 head_type="attn_gate"):
         super().__init__()
         cfg = BACKBONE_CONFIGS[backbone_key]
         self.backbone_key = backbone_key
         self.use_video = use_video
+        self.head_type = head_type
 
         self.backbone = timm.create_model(
             cfg["timm_name"],
@@ -73,23 +79,34 @@ class DualViewModel(nn.Module):
         feat_dim = self.backbone.num_features
         self.feat_dim = feat_dim
 
-        self.attn_gate = nn.Sequential(
-            nn.Linear(feat_dim * 2, feat_dim),
-            nn.GELU(),
-            nn.Linear(feat_dim, 2),
-            nn.Softmax(dim=1),
-        )
-
-        self.head = nn.Sequential(
-            nn.LayerNorm(feat_dim),
-            nn.Linear(feat_dim, 512),
-            nn.GELU(),
-            nn.Dropout(drop_rate),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Dropout(drop_rate * 0.5),
-            nn.Linear(256, num_classes),
-        )
+        if head_type == "attn_gate":
+            self.attn_gate = nn.Sequential(
+                nn.Linear(feat_dim * 2, feat_dim),
+                nn.GELU(),
+                nn.Linear(feat_dim, 2),
+                nn.Softmax(dim=1),
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(feat_dim),
+                nn.Linear(feat_dim, 512),
+                nn.GELU(),
+                nn.Dropout(drop_rate),
+                nn.Linear(512, 256),
+                nn.GELU(),
+                nn.Dropout(drop_rate * 0.5),
+                nn.Linear(256, num_classes),
+            )
+        else:
+            # 1등 솔루션 스타일: concat → simple MLP
+            self.attn_gate = None
+            self.head = nn.Sequential(
+                nn.Dropout(drop_rate),
+                nn.Linear(feat_dim * 2, 256),
+                nn.BatchNorm1d(256),
+                nn.GELU(),
+                nn.Dropout(drop_rate * 0.5),
+                nn.Linear(256, num_classes),
+            )
 
     def encode(self, images):
         if images.dim() == 5:
@@ -101,8 +118,13 @@ class DualViewModel(nn.Module):
     def forward(self, front, top, video_frames=None, video_mask=None):
         f = self.encode(front)
         t = self.encode(top)
-        gate = self.attn_gate(torch.cat([f, t], dim=1))
-        fused = gate[:, 0:1] * f + gate[:, 1:2] * t
+
+        if self.head_type == "attn_gate":
+            gate = self.attn_gate(torch.cat([f, t], dim=1))
+            fused = gate[:, 0:1] * f + gate[:, 1:2] * t
+        else:
+            # Simple concat (1등 솔루션 스타일)
+            fused = torch.cat([f, t], dim=1)
 
         if self.use_video and video_frames is not None:
             fused = self._fuse_video(fused, video_frames, video_mask)

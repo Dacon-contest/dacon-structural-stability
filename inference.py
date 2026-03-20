@@ -93,8 +93,13 @@ def ensemble_predict(args):
             if not os.path.exists(path):
                 continue
             print(f"  Loading {bk} fold {fold}")
-            model = build_model(bk, pretrained=False, num_classes=2, drop_rate=0.0)
-            model.load_state_dict(torch.load(path, map_location=device, weights_only=True), strict=False)
+            model = build_model(bk, pretrained=False, num_classes=2, drop_rate=0.0,
+                                head_type=args.head_type)
+            saved = torch.load(path, map_location=device, weights_only=True)
+            model_sd = model.state_dict()
+            filtered = {k: v for k, v in saved.items()
+                        if k in model_sd and v.shape == model_sd[k].shape}
+            model.load_state_dict(filtered, strict=False)
             model = model.to(device)
 
             if args.tta:
@@ -157,8 +162,13 @@ def validate_on_dev(args):
             path = os.path.join(SAVE_DIR, f"{bk}_fold{fold}.pth")
             if not os.path.exists(path):
                 continue
-            model = build_model(bk, pretrained=False, num_classes=2, drop_rate=0.0)
-            model.load_state_dict(torch.load(path, map_location=device, weights_only=True), strict=False)
+            model = build_model(bk, pretrained=False, num_classes=2, drop_rate=0.0,
+                                head_type=args.head_type)
+            saved = torch.load(path, map_location=device, weights_only=True)
+            model_sd = model.state_dict()
+            filtered = {k: v for k, v in saved.items()
+                        if k in model_sd and v.shape == model_sd[k].shape}
+            model.load_state_dict(filtered, strict=False)
             model = model.to(device)
 
             if args.tta:
@@ -191,6 +201,9 @@ def main():
     p.add_argument("--n_folds", type=int, default=5)
     p.add_argument("--tta", action="store_true")
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--head_type", type=str, default="simple",
+                   choices=["attn_gate", "simple"],
+                   help="Head 구조 (학습 시 사용한 것과 동일해야 함)")
     p.add_argument("--validate", action="store_true", help="Dev set 검증")
     args = p.parse_args()
 
