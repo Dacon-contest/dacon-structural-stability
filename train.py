@@ -369,13 +369,21 @@ def pretrain(args):
         ckpt_path = ckpt_path_fallback
     if args.resume and os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["optimizer"])
-        sched.load_state_dict(ck["scheduler"])
-        scaler.load_state_dict(ck["scaler"])
-        start_ep = ck["epoch"] + 1
-        best_ll = ck["best_ll"]
-        print(f"  Resumed epoch {start_ep}, best={best_ll:.4f}")
+        try:
+            model.load_state_dict(ck["model"])
+            opt.load_state_dict(ck["optimizer"])
+            sched.load_state_dict(ck["scheduler"])
+            scaler.load_state_dict(ck["scaler"])
+            start_ep = ck["epoch"] + 1
+            best_ll = ck["best_ll"]
+            print(f"  Resumed epoch {start_ep}, best={best_ll:.4f}")
+        except RuntimeError:
+            print(f"  [WARN] ckpt head 불일치 → backbone만 로드, 처음부터 시작")
+            model_sd = model.state_dict()
+            filtered = {k: v for k, v in ck["model"].items()
+                        if k in model_sd and v.shape == model_sd[k].shape}
+            model.load_state_dict(filtered, strict=False)
+            print(f"    로드: {len(filtered)}/{len(ck['model'])} params")
 
     for ep in range(start_ep, args.pretrain_epochs):
         t0 = time.time()
@@ -431,7 +439,7 @@ def finetune(args):
           f"Sched={args.scheduler} | Head={args.head_type}")
     print(f"  head_lr={head_lr:.1e} | bb_lr={bb_lr:.1e} | wd={wd} | drop={drop}")
     if args.merge_dev:
-        print(f"  ★ merge_dev: train+dev 합쳐서 K-Fold (1등 전략)")
+        print(f"  ★ merge_dev: train+dev 합쳐서 K-Fold")
     print("=" * 60)
 
     # 데이터 전략 결정
@@ -576,14 +584,23 @@ def finetune(args):
 
         if args.resume and os.path.exists(ckpt_path):
             ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-            model.load_state_dict(ck["model"])
-            opt.load_state_dict(ck["optimizer"])
-            sched.load_state_dict(ck["scheduler"])
-            scaler.load_state_dict(ck["scaler"])
-            start_ep = ck["epoch"] + 1
-            best_ll = ck["best_ll"]
-            patience_cnt = ck.get("patience", 0)
-            print(f"  Resumed fold {fold} ep {start_ep}, best={best_ll:.6f}")
+            # head 구조가 다른 ckpt면 backbone만 로드하고 처음부터
+            try:
+                model.load_state_dict(ck["model"])
+                opt.load_state_dict(ck["optimizer"])
+                sched.load_state_dict(ck["scheduler"])
+                scaler.load_state_dict(ck["scaler"])
+                start_ep = ck["epoch"] + 1
+                best_ll = ck["best_ll"]
+                patience_cnt = ck.get("patience", 0)
+                print(f"  Resumed fold {fold} ep {start_ep}, best={best_ll:.6f}")
+            except RuntimeError as e:
+                print(f"  [WARN] ckpt head 불일치 → backbone만 로드, 처음부터 시작")
+                model_sd = model.state_dict()
+                filtered = {k: v for k, v in ck["model"].items()
+                            if k in model_sd and v.shape == model_sd[k].shape}
+                model.load_state_dict(filtered, strict=False)
+                print(f"    로드: {len(filtered)}/{len(ck['model'])} params")
 
         for ep in range(start_ep, args.finetune_epochs):
             t0 = time.time()
