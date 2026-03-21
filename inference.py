@@ -62,18 +62,30 @@ def predict(model, loader, device):
 
 
 @torch.no_grad()
-def predict_tta(model, csv_path, data_dir, img_size, device, bs=8):
+def predict_tta(model, csv_path, data_dir, img_size, device, bs=8, nw=0):
     model.eval()
     tta_tfs = get_tta_transforms(img_size)
     all_probs, all_ids = [], None
     for tf in tta_tfs:
         ds = InferDataset(csv_path, data_dir, tf)
-        loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=4, pin_memory=True)
+        loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=True)
         probs, ids = predict(model, loader, device)
         all_probs.append(probs)
         if all_ids is None:
             all_ids = ids
     return np.mean(all_probs, axis=0), all_ids
+
+
+def _find_checkpoint_paths(backbone, n_folds, seeds):
+    """seed별 checkpoint 경로 탐색: [{seed}]_fold{fold}.pth"""
+    paths = []
+    for seed in seeds:
+        sfx = '' if seed == 42 else f'_s{seed}'
+        for fold in range(n_folds):
+            p = os.path.join(SAVE_DIR, f"{backbone}{sfx}_fold{fold}.pth")
+            if os.path.exists(p):
+                paths.append((p, backbone, fold, seed))
+    return paths
 
 
 def ensemble_predict(args):
@@ -88,11 +100,10 @@ def ensemble_predict(args):
         preset = get_train_preset(bk)
         bs = preset["batch_size"] * 2  # inference can use larger batch
 
-        for fold in range(args.n_folds):
-            path = os.path.join(SAVE_DIR, f"{bk}_fold{fold}.pth")
-            if not os.path.exists(path):
-                continue
-            print(f"  Loading {bk} fold {fold}")
+        ckpts = _find_checkpoint_paths(bk, args.n_folds, args.seeds)
+        for path, _, fold, seed in ckpts:
+            sfx = '' if seed == 42 else f' s{seed}'
+            print(f"  Loading {bk} fold {fold}{sfx}")
             model = build_model(bk, pretrained=False, num_classes=2, drop_rate=0.0,
                                 head_type=args.head_type)
             saved = torch.load(path, map_location=device, weights_only=True)
@@ -102,12 +113,13 @@ def ensemble_predict(args):
             model.load_state_dict(filtered, strict=False)
             model = model.to(device)
 
+            nw = getattr(args, 'num_workers', 4)
             if args.tta:
-                probs, ids = predict_tta(model, test_csv, test_dir, img_size, device, bs)
+                probs, ids = predict_tta(model, test_csv, test_dir, img_size, device, bs, nw=nw)
             else:
                 tf = get_val_transforms(img_size)
                 ds = InferDataset(test_csv, test_dir, tf)
-                loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=4, pin_memory=True)
+                loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=True)
                 probs, ids = predict(model, loader, device)
 
             all_preds.append(probs)
@@ -136,6 +148,8 @@ def ensemble_predict(args):
     sub["stable_prob"] /= row_sum
 
     name = f"submission_{'_'.join(args.backbones)}"
+    if len(args.seeds) > 1:
+        name += f"_{len(args.seeds)}seeds"
     if args.tta:
         name += "_tta"
     out = os.path.join(OUTPUT_DIR, f"{name}.csv")
@@ -158,10 +172,9 @@ def validate_on_dev(args):
     for bk in args.backbones:
         cfg = get_backbone_config(bk)
         img_size = cfg["img_size"]
-        for fold in range(args.n_folds):
-            path = os.path.join(SAVE_DIR, f"{bk}_fold{fold}.pth")
-            if not os.path.exists(path):
-                continue
+        ckpts = _find_checkpoint_paths(bk, args.n_folds, args.seeds)
+        for path, _, fold, seed in ckpts:
+            sfx = '' if seed == 42 else f' s{seed}'
             model = build_model(bk, pretrained=False, num_classes=2, drop_rate=0.0,
                                 head_type=args.head_type)
             saved = torch.load(path, map_location=device, weights_only=True)
@@ -171,12 +184,13 @@ def validate_on_dev(args):
             model.load_state_dict(filtered, strict=False)
             model = model.to(device)
 
+            nw = getattr(args, 'num_workers', 4)
             if args.tta:
-                probs, _ = predict_tta(model, dev_csv, dev_dir, img_size, device)
+                probs, _ = predict_tta(model, dev_csv, dev_dir, img_size, device, nw=nw)
             else:
                 tf = get_val_transforms(img_size)
                 ds = InferDataset(dev_csv, dev_dir, tf)
-                loader = DataLoader(ds, batch_size=8, shuffle=False, num_workers=4, pin_memory=True)
+                loader = DataLoader(ds, batch_size=8, shuffle=False, num_workers=nw, pin_memory=True)
                 probs, _ = predict(model, loader, device)
             all_preds.append(probs)
             del model
@@ -199,12 +213,15 @@ def main():
     p = argparse.ArgumentParser(description="추론 v2")
     p.add_argument("--backbones", nargs="+", default=["dinov2_large"], choices=get_backbone_choices())
     p.add_argument("--n_folds", type=int, default=5)
+    p.add_argument("--seeds", nargs="+", type=int, default=[42],
+                   help="Multi-seed 앨상블용 seed 목록 (e.g. --seeds 42 123 777)")
     p.add_argument("--tta", action="store_true")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--head_type", type=str, default="simple",
                    choices=["attn_gate", "simple"],
                    help="Head 구조 (학습 시 사용한 것과 동일해야 함)")
     p.add_argument("--validate", action="store_true", help="Dev set 검증")
+    p.add_argument("--num_workers", type=int, default=4, help="DataLoader workers (코랩은 0)")
     args = p.parse_args()
 
     if args.validate:

@@ -58,7 +58,7 @@ def get_train_transforms(img_size=384):
 
 
 def get_train_transforms_simple(img_size=384):
-    """1등 솔루션 참고 단순 증강 — ColorJitter 강하게, 나머지 최소화"""
+    """단순 증강 — ColorJitter 강하게, 나머지 최소화"""
     return A.Compose([
         A.Resize(img_size, img_size),
         A.HorizontalFlip(p=0.5),

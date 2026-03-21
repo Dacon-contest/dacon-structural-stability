@@ -56,7 +56,7 @@ class DualViewModel(nn.Module):
     """공유 백본 → Fusion → MLP Head
     head_type:
       - "attn_gate": Attention Gate Fusion → deep MLP (기존)
-      - "simple":    Concat → BN+MLP (1등 솔루션 스타일, 더 단순)
+      - "simple":    Concat → BN+MLP (단순 헤드)
     """
 
     def __init__(self, backbone_key="eva02_large", pretrained=True,
@@ -97,7 +97,7 @@ class DualViewModel(nn.Module):
                 nn.Linear(256, num_classes),
             )
         else:
-            # 1등 솔루션 스타일: concat → simple MLP
+            # concat → simple MLP
             self.attn_gate = None
             self.head = nn.Sequential(
                 nn.Dropout(drop_rate),
@@ -123,7 +123,7 @@ class DualViewModel(nn.Module):
             gate = self.attn_gate(torch.cat([f, t], dim=1))
             fused = gate[:, 0:1] * f + gate[:, 1:2] * t
         else:
-            # Simple concat (1등 솔루션 스타일)
+            # Simple concat
             fused = torch.cat([f, t], dim=1)
 
         if self.use_video and video_frames is not None:

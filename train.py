@@ -75,6 +75,11 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+def seed_suffix(seed):
+    """seed!=42이면 '_s{seed}' 접미사 반환, 42면 '' (기존 호환)"""
+    return '' if seed == 42 else f'_s{seed}'
+
+
 # =========================================================================
 # Losses
 # =========================================================================
@@ -359,12 +364,13 @@ def pretrain(args):
     smooth = LabelSmoothingLoss(2, 0.05)
     loss_fn = lambda logits, targets: combined_loss(logits, targets, focal, smooth)
     scaler = GradScaler("cuda")
-    log_path = os.path.join(SAVE_DIR, f"{args.backbone}_pretrain_log.csv")
+    sfx = seed_suffix(args.seed)
+    log_path = os.path.join(SAVE_DIR, f"{args.backbone}{sfx}_pretrain_log.csv")
 
     best_ll = float("inf")
     start_ep = 0
-    ckpt_path = os.path.join(LOCAL_CKPT_DIR, f"{args.backbone}_pretrain_ckpt.pth")
-    ckpt_path_fallback = os.path.join(SAVE_DIR, f"{args.backbone}_pretrain_ckpt.pth")
+    ckpt_path = os.path.join(LOCAL_CKPT_DIR, f"{args.backbone}{sfx}_pretrain_ckpt.pth")
+    ckpt_path_fallback = os.path.join(SAVE_DIR, f"{args.backbone}{sfx}_pretrain_ckpt.pth")
     if args.resume and not os.path.exists(ckpt_path) and os.path.exists(ckpt_path_fallback):
         ckpt_path = ckpt_path_fallback
     if args.resume and os.path.exists(ckpt_path):
@@ -405,7 +411,7 @@ def pretrain(args):
                            "val_logloss": vm["logloss"], "val_acc": vm["acc"], "best": best_ll})
 
         if improved:
-            safe_save(model.state_dict(), os.path.join(SAVE_DIR, f"{args.backbone}_pretrained.pth"))
+            safe_save(model.state_dict(), os.path.join(SAVE_DIR, f"{args.backbone}{sfx}_pretrained.pth"))
             print(f"    >>> Saved (logloss={vm['logloss']:.4f})")
 
         safe_save({"epoch": ep, "model": model.state_dict(), "optimizer": opt.state_dict(),
@@ -439,12 +445,12 @@ def finetune(args):
           f"Sched={args.scheduler} | Head={args.head_type}")
     print(f"  head_lr={head_lr:.1e} | bb_lr={bb_lr:.1e} | wd={wd} | drop={drop}")
     if args.merge_dev:
-        print(f"  ★ merge_dev: train+dev 합쳐서 K-Fold")
+        print(f"merge_dev: train+dev 합쳐서 K-Fold")
     print("=" * 60)
 
     # 데이터 전략 결정
     if args.merge_dev:
-        # 1등 전략: train+dev 전체 합침 → K-Fold
+        # train+dev 전체 합침 → K-Fold
         all_samples = build_dacon_samples(DATA_DIR, include_dev=True, dev_oversample=1)
         dev_samples = []
         dev_aug_samples = []
@@ -465,10 +471,11 @@ def finetune(args):
     # 증강 선택
     if args.simple_aug:
         train_tf = get_train_transforms_simple(img_size)
-        print(f"  Augmentation: simple (1등 스타일)")
+        print(f"  Augmentation: simple")
     else:
         train_tf = get_train_transforms(img_size)
 
+    sfx = seed_suffix(args.seed)
     skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
     fold_results = []
 
@@ -476,9 +483,9 @@ def finetune(args):
         if args.fold is not None and fold != args.fold:
             continue
 
-        ckpt_path = os.path.join(LOCAL_CKPT_DIR, f"{args.backbone}_fold{fold}_ckpt.pth")
-        ckpt_fallback = os.path.join(SAVE_DIR, f"{args.backbone}_fold{fold}_ckpt.pth")
-        best_path = os.path.join(SAVE_DIR, f"{args.backbone}_fold{fold}.pth")
+        ckpt_path = os.path.join(LOCAL_CKPT_DIR, f"{args.backbone}{sfx}_fold{fold}_ckpt.pth")
+        ckpt_fallback = os.path.join(SAVE_DIR, f"{args.backbone}{sfx}_fold{fold}_ckpt.pth")
+        best_path = os.path.join(SAVE_DIR, f"{args.backbone}{sfx}_fold{fold}.pth")
 
         if args.skip_completed and os.path.exists(best_path) \
                 and not os.path.exists(ckpt_path) and not os.path.exists(ckpt_fallback):
@@ -578,7 +585,7 @@ def finetune(args):
         best_ll = float("inf")
         patience_cnt = 0
         start_ep = 0
-        log_path = os.path.join(SAVE_DIR, f"{args.backbone}_fold{fold}_log.csv")
+        log_path = os.path.join(SAVE_DIR, f"{args.backbone}{sfx}_fold{fold}_log.csv")
         if not os.path.exists(ckpt_path) and os.path.exists(ckpt_fallback):
             ckpt_path = ckpt_fallback
 
@@ -634,7 +641,7 @@ def finetune(args):
                        "best_ll": best_ll, "patience": patience_cnt}, ckpt_path)
 
             if improved:
-                safe_save(model.state_dict(), os.path.join(SAVE_DIR, f"{args.backbone}_fold{fold}.pth"))
+                safe_save(model.state_dict(), os.path.join(SAVE_DIR, f"{args.backbone}{sfx}_fold{fold}.pth"))
                 print(f"    >>> Saved fold {fold} (logloss={vm['logloss']:.6f})")
                 patience_cnt = 0
             else:
@@ -644,7 +651,7 @@ def finetune(args):
                     break
 
         # 완료된 fold의 resume ckpt 삭제 (디스크 절약)
-        local_ckpt = os.path.join(LOCAL_CKPT_DIR, f"{args.backbone}_fold{fold}_ckpt.pth")
+        local_ckpt = os.path.join(LOCAL_CKPT_DIR, f"{args.backbone}{sfx}_fold{fold}_ckpt.pth")
         if os.path.exists(local_ckpt):
             os.remove(local_ckpt)
             print(f"  Resume ckpt 삭제: {local_ckpt}")
@@ -685,11 +692,11 @@ def main():
     p.add_argument("--dev_aug_repeat", type=int, default=3,
                    help="dev_aug oversample 횟수 (기본 3×)")
     p.add_argument("--merge_dev", action="store_true",
-                   help="★ 1등 전략: train+dev 합쳐서 K-Fold (1100개 전체 활용)")
+                   help="train+dev 합쳐서 K-Fold (1100개 전체 활용)")
     p.add_argument("--loss", type=str, default="ce", choices=["ce", "focal"],
                    help="Loss 함수 (ce: CrossEntropy, focal: Focal+LabelSmoothing)")
     p.add_argument("--no_mixup", action="store_true",
-                   help="Mixup/CutMix 비활성화 (1등 전략)")
+                   help="Mixup/CutMix 비활성화")
     p.add_argument("--head_lr", type=float, default=None,
                    help="Head LR 직접 지정 (미지정 시 preset 사용)")
     p.add_argument("--bb_lr", type=float, default=None,
@@ -701,11 +708,11 @@ def main():
                    help="스케줄러 (cosine_wr: WarmRestarts T0=10)")
     p.add_argument("--head_type", type=str, default="simple",
                    choices=["attn_gate", "simple"],
-                   help="Head 구조 (simple: 1등 스타일 concat+MLP)")
+                   help="Head 구조 (simple: concat+MLP)")
     p.add_argument("--drop_rate", type=float, default=None,
                    help="Dropout rate (미지정 시 0.3)")
     p.add_argument("--simple_aug", action="store_true",
-                   help="단순 증강 사용 (1등 스타일)")
+                   help="단순 증강 사용")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--skip_completed", action="store_true",
                    help="이미 best 모델이 있고 resume ckpt 없는 fold 건너뛰기")
