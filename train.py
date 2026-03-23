@@ -126,6 +126,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_mix
     correct = 0
     total = 0
 
+    cur_lr = optimizer.param_groups[0]['lr']
     pbar = tqdm(loader, desc="Train", leave=False)
     for batch in pbar:
         front, top, labels = batch[0].to(device), batch[1].to(device), batch[2].to(device)
@@ -153,7 +154,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_mix
         correct += (preds == labels).sum().item() if not use_mixup or random.random() >= 0.5 else 0
         total += front.size(0)
 
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        avg_so_far = total_loss / total
+        pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{avg_so_far:.4f}", lr=f"{cur_lr:.1e}")
 
     avg_loss = total_loss / total
     return avg_loss
@@ -185,9 +187,16 @@ def validate(model, loader, criterion, device):
 
     avg_loss = total_loss / total
     logloss = log_loss(all_labels, all_probs, labels=[0, 1])
-    accuracy = (all_probs.argmax(axis=1) == all_labels).mean()
+    preds = all_probs.argmax(axis=1)
+    accuracy = (preds == all_labels).mean()
 
-    return avg_loss, logloss, accuracy
+    # 클래스별 정확도
+    stable_mask = all_labels == 0
+    unstable_mask = all_labels == 1
+    stable_acc = (preds[stable_mask] == 0).mean() if stable_mask.sum() > 0 else 0.0
+    unstable_acc = (preds[unstable_mask] == 1).mean() if unstable_mask.sum() > 0 else 0.0
+
+    return avg_loss, logloss, accuracy, stable_acc, unstable_acc
 
 
 class TransformDataset(torch.utils.data.Dataset):
@@ -345,15 +354,31 @@ def pretrain(args):
         best_logloss = ckpt["best_logloss"]
         print(f"  >>> Resumed from epoch {start_epoch} (best LogLoss: {best_logloss:.4f})")
 
+    epoch_start = time.time()
     for epoch in range(start_epoch, args.pretrain_epochs):
-        print(f"\nEpoch {epoch + 1}/{args.pretrain_epochs}")
+        t0 = time.time()
+        cur_lr = optimizer.param_groups[0]['lr']
+        print(f"\n{'─'*60}")
+        print(f"Epoch {epoch + 1}/{args.pretrain_epochs}  |  LR: {cur_lr:.2e}")
+
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer,
                                       scaler, device, use_mixup=True)
-        val_loss, val_logloss, val_acc = validate(model, val_loader, criterion, device)
+        val_loss, val_logloss, val_acc, val_s_acc, val_u_acc = validate(
+            model, val_loader, criterion, device)
         scheduler.step()
 
-        print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-              f"Val LogLoss: {val_logloss:.4f} | Val Acc: {val_acc:.4f}")
+        elapsed = time.time() - t0
+        total_elapsed = time.time() - epoch_start
+        remaining = total_elapsed / (epoch - start_epoch + 1) * (args.pretrain_epochs - epoch - 1)
+
+        improved = val_logloss < best_logloss
+        marker = " ★ NEW BEST" if improved else ""
+
+        print(f"  Train Loss : {train_loss:.4f}")
+        print(f"  Val Loss   : {val_loss:.4f}")
+        print(f"  Val LogLoss: {val_logloss:.4f}  (best: {best_logloss:.4f}){marker}")
+        print(f"  Val Acc    : {val_acc:.4f}  [stable: {val_s_acc:.4f} | unstable: {val_u_acc:.4f}]")
+        print(f"  Time: {elapsed/60:.1f}min  |  ETA: {remaining/60:.0f}min")
 
         # 매 에폭 체크포인트 저장 (중단 대비)
         torch.save({
@@ -365,13 +390,15 @@ def pretrain(args):
             "best_logloss": best_logloss,
         }, ckpt_path)
 
-        if val_logloss < best_logloss:
+        if improved:
             best_logloss = val_logloss
             save_path = os.path.join(SAVE_DIR, f"{args.model}_pretrained.pth")
             torch.save(model.state_dict(), save_path)
-            print(f"  >>> Saved best pretrained model (LogLoss: {val_logloss:.4f})")
+            print(f"  >>> Saved best pretrained model")
 
-    print(f"\n  Best pretrain LogLoss: {best_logloss:.4f}")
+    print(f"\n{'═'*60}")
+    print(f"  Pretrain complete — Best LogLoss: {best_logloss:.4f}")
+    print(f"{'═'*60}")
 
 
 def finetune(args):
@@ -493,15 +520,31 @@ def finetune(args):
             patience_count = ckpt.get("patience_count", 0)
             print(f"  >>> Resumed fold {fold} from epoch {start_epoch} (best LogLoss: {best_logloss:.6f})")
 
+        fold_start = time.time()
         for epoch in range(start_epoch, args.finetune_epochs):
-            print(f"\n  Epoch {epoch + 1}/{args.finetune_epochs}")
+            t0 = time.time()
+            cur_lr = optimizer.param_groups[-1]['lr']
+            print(f"\n  {'─'*50}")
+            print(f"  Epoch {epoch + 1}/{args.finetune_epochs}  |  LR(head): {cur_lr:.2e}  |  patience: {patience_count}/{args.patience}")
+
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer,
                                           scaler, device, use_mixup=True)
-            val_loss, val_logloss, val_acc = validate(model, val_loader, criterion, device)
+            val_loss, val_logloss, val_acc, val_s_acc, val_u_acc = validate(
+                model, val_loader, criterion, device)
             scheduler.step()
 
-            print(f"    Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                  f"Val LogLoss: {val_logloss:.6f} | Val Acc: {val_acc:.4f}")
+            elapsed = time.time() - t0
+            total_elapsed = time.time() - fold_start
+            remaining = total_elapsed / (epoch - start_epoch + 1) * (args.finetune_epochs - epoch - 1)
+
+            improved = val_logloss < best_logloss
+            marker = " ★ NEW BEST" if improved else ""
+
+            print(f"    Train Loss : {train_loss:.4f}")
+            print(f"    Val Loss   : {val_loss:.4f}")
+            print(f"    Val LogLoss: {val_logloss:.6f}  (best: {best_logloss:.6f}){marker}")
+            print(f"    Val Acc    : {val_acc:.4f}  [stable: {val_s_acc:.4f} | unstable: {val_u_acc:.4f}]")
+            print(f"    Time: {elapsed/60:.1f}min  |  ETA: {remaining/60:.0f}min")
 
             # 매 에폭 체크포인트 저장 (중단 대비)
             torch.save({
@@ -514,11 +557,11 @@ def finetune(args):
                 "patience_count": patience_count,
             }, fold_ckpt_path)
 
-            if val_logloss < best_logloss:
+            if improved:
                 best_logloss = val_logloss
                 save_path = os.path.join(SAVE_DIR, f"{args.model}_fold{fold}.pth")
                 torch.save(model.state_dict(), save_path)
-                print(f"    >>> Saved best fold {fold} model (LogLoss: {val_logloss:.6f})")
+                print(f"    >>> Saved best fold {fold} model")
                 patience_count = 0
             else:
                 patience_count += 1
