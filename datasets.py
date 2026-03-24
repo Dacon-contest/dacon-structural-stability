@@ -74,7 +74,7 @@ def get_train_transforms_simple(img_size=384):
 
 
 def get_val_transforms(img_size=384):
-    crop = int(img_size * 0.84)
+    crop = int(img_size * 0.9)
     return A.Compose([
         A.CenterCrop(crop, crop),
         A.Resize(img_size, img_size),
@@ -85,7 +85,7 @@ def get_val_transforms(img_size=384):
 
 def get_tta_transforms(img_size=384):
     norm = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    crop = int(img_size * 0.84)
+    crop = int(img_size * 0.9)
     return [
         # 0: base (center crop)
         A.Compose([A.CenterCrop(crop, crop),
@@ -99,8 +99,8 @@ def get_tta_transforms(img_size=384):
                     A.Resize(img_size, img_size),
                     A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=1.0),
                     A.Normalize(**norm), ToTensorV2()]),
-        # 3: tighter crop (76% ≈ 84% of 90%)
-        A.Compose([A.CenterCrop(int(img_size * 0.76), int(img_size * 0.76)),
+        # 3: tighter crop (90% of 90% = 81%)
+        A.Compose([A.CenterCrop(int(img_size * 0.9), int(img_size * 0.9)),
                     A.Resize(img_size, img_size), A.Normalize(**norm), ToTensorV2()]),
     ]
 
