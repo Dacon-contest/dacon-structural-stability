@@ -181,11 +181,14 @@ def mixup_data(front, top, labels, alpha=0.4):
 class DaconDualViewDataset(Dataset):
     """Dacon 대회 데이터 (front + top + optional video)"""
 
-    def __init__(self, samples, transform=None, use_video=False, num_video_frames=5):
+    def __init__(self, samples, transform=None, use_video=False, num_video_frames=5,
+                 video_frame_aug=False, video_frame_aug_prob=0.5):
         self.samples = samples   # [(data_dir, sample_id, label_int), ...]
         self.transform = transform
         self.use_video = use_video
         self.num_video_frames = num_video_frames
+        self.video_frame_aug = video_frame_aug
+        self.video_frame_aug_prob = video_frame_aug_prob
 
     def __len__(self):
         return len(self.samples)
@@ -194,10 +197,33 @@ class DaconDualViewDataset(Dataset):
         img = cv2.imread(path)
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else np.zeros((384, 384, 3), dtype=np.uint8)
 
+    def _load_video_frame(self, video_path, frame_idx=3):
+        """영상에서 특정 프레임(기본 frame#3 = 0.1초) 추출"""
+        if not os.path.exists(video_path):
+            return None
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            return None
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
     def __getitem__(self, idx):
         data_dir, sid, label = self.samples[idx]
         d = os.path.join(data_dir, sid)
-        front = self._load_img(os.path.join(d, "front.png"))
+
+        # video_frame_aug: 50% 확률로 front.png 대신 영상 0.1초 프레임 사용
+        use_vf = (self.video_frame_aug
+                  and np.random.random() < self.video_frame_aug_prob)
+        if use_vf:
+            vid_path = os.path.join(d, "simulation.mp4")
+            vf = self._load_video_frame(vid_path, frame_idx=3)
+            front = vf if vf is not None else self._load_img(os.path.join(d, "front.png"))
+        else:
+            front = self._load_img(os.path.join(d, "front.png"))
         top = self._load_img(os.path.join(d, "top.png"))
 
         if self.transform:

@@ -453,6 +453,10 @@ def finetune(args):
     print(f"  Loss={args.loss} | Mixup={'OFF' if args.no_mixup else 'ON'} | "
           f"Sched={args.scheduler} | Head={args.head_type}")
     print(f"  head_lr={head_lr:.1e} | bb_lr={bb_lr:.1e} | wd={wd} | drop={drop}")
+    if getattr(args, 'video_frame_aug', False):
+        print(f"  video_frame_aug: ON (50% 확률로 front 대신 0.1초 프레임)")
+    if getattr(args, 'init_from_best', False):
+        print(f"  init_from_best: ON (기존 fold best 가중치에서 이어서 학습)")
     if args.merge_dev:
         print(f"merge_dev: train+dev 합쳐서 K-Fold")
     print("=" * 60)
@@ -511,8 +515,10 @@ def finetune(args):
             trn = trn + dev_aug_samples
             print(f"  Train: {len(trn)} (원본 {len(trn)-len(dev_aug_samples)} + dev_aug {len(dev_aug_samples)})")
 
+        vfa = getattr(args, 'video_frame_aug', False)
         train_ds = DaconDualViewDataset(trn, train_tf,
-                                         use_video=args.use_video, num_video_frames=args.num_video_frames)
+                                         use_video=args.use_video, num_video_frames=args.num_video_frames,
+                                         video_frame_aug=vfa)
         val_ds = DaconDualViewDataset(val, get_val_transforms(img_size),
                                        use_video=args.use_video, num_video_frames=args.num_video_frames)
 
@@ -561,6 +567,20 @@ def finetune(args):
             print(f"  Loaded pretrained: {pt_path} ({len(filtered)} params, skipped {len(skipped)})")
         else:
             print(f"  No pretrained ckpt — using ImageNet weights")
+
+        # init_from_best: 기존 fold best 가중치에서 이어서 학습
+        if getattr(args, 'init_from_best', False):
+            fold_best = os.path.join(SAVE_DIR, f"{args.backbone}{sfx}_fold{fold}.pth")
+            if os.path.exists(fold_best):
+                saved = torch.load(fold_best, map_location="cpu", weights_only=True)
+                model_sd = model.state_dict()
+                filtered = {k: v for k, v in saved.items()
+                            if k in model_sd and v.shape == model_sd[k].shape}
+                model.load_state_dict(filtered, strict=False)
+                print(f"  Loaded fold {fold} best weights for continued fine-tuning ({len(filtered)} params)")
+            else:
+                print(f"  [WARN] init_from_best: fold {fold} best 가중치 없음 → pretrained/ImageNet start")
+
         model = model.to(device)
 
         # Differential LR
@@ -722,8 +742,12 @@ def main():
                    help="Dropout rate (미지정 시 0.3)")
     p.add_argument("--simple_aug", action="store_true",
                    help="단순 증강 사용")
+    p.add_argument("--video_frame_aug", action="store_true",
+                   help="학습 시 50%% 확률로 front.png 대신 영상 0.1초 프레임 사용 (데이터 증강)")
     p.add_argument("--no_dacon_pretrain", action="store_true",
                    help="Pretrain에서 Dacon 대회 데이터 제외 (ShapeStacks만 사용)")
+    p.add_argument("--init_from_best", action="store_true",
+                   help="기존 fold best 가중치에서 이어서 학습 (fresh optimizer)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--skip_completed", action="store_true",
                    help="이미 best 모델이 있고 resume ckpt 없는 fold 건너뛰기")
