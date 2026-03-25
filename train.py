@@ -42,6 +42,7 @@ from datasets import (
     get_train_transforms,
     get_train_transforms_simple,
     get_val_transforms,
+    get_val_transforms_nocrop,
     cutmix_data,
     mixup_data,
 )
@@ -296,12 +297,17 @@ def pretrain(args):
     bs = args.batch_size_override or preset["batch_size"]
     ga = args.grad_accum_override or preset["grad_accum"]
 
+    use_simple = getattr(args, 'simple_aug', False)
     print("=" * 60)
     print(f"  PRETRAIN [{args.backbone}]  img={img_size}  bs={bs}  accum={ga}")
+    print(f"  aug={'simple (no CenterCrop)' if use_simple else 'full'}")
     print("=" * 60)
 
-    train_tf = get_train_transforms(img_size)
-    val_tf = get_val_transforms(img_size)
+    if use_simple:
+        train_tf = get_train_transforms_simple(img_size)
+    else:
+        train_tf = get_train_transforms(img_size)
+    val_tf = get_val_transforms_nocrop(img_size)
 
     # --- ShapeStacks h=6 ---
     ss_dir = os.path.join(DATA_DIR, "shapestacks")
@@ -311,12 +317,15 @@ def pretrain(args):
         if len(ss) > 0:
             ds_list.append(ss)
 
-    # --- Dacon train+dev (domain alignment) ---
-    dacon_samples = build_dacon_samples(DATA_DIR, include_dev=True, dev_oversample=3)
-    if dacon_samples:
-        dacon_ds = DaconDualViewDataset(dacon_samples, transform=train_tf)
-        ds_list.append(dacon_ds)
-        print(f"  Dacon samples: {len(dacon_ds)} (train + dev 3×)")
+    # --- Dacon train+dev (domain alignment, optional) ---
+    if not getattr(args, 'no_dacon_pretrain', False):
+        dacon_samples = build_dacon_samples(DATA_DIR, include_dev=True, dev_oversample=3)
+        if dacon_samples:
+            dacon_ds = DaconDualViewDataset(dacon_samples, transform=train_tf)
+            ds_list.append(dacon_ds)
+            print(f"  Dacon samples: {len(dacon_ds)} (train + dev 3×)")
+    else:
+        print("  Dacon data: EXCLUDED from pretrain")
 
     if not ds_list:
         print("[ERROR] No pretrain data!")
@@ -713,6 +722,8 @@ def main():
                    help="Dropout rate (미지정 시 0.3)")
     p.add_argument("--simple_aug", action="store_true",
                    help="단순 증강 사용")
+    p.add_argument("--no_dacon_pretrain", action="store_true",
+                   help="Pretrain에서 Dacon 대회 데이터 제외 (ShapeStacks만 사용)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--skip_completed", action="store_true",
                    help="이미 best 모델이 있고 resume ckpt 없는 fold 건너뛰기")

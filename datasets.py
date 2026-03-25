@@ -83,6 +83,15 @@ def get_val_transforms(img_size=384):
     ])
 
 
+def get_val_transforms_nocrop(img_size=384):
+    """CenterCrop 없는 검증 변환 (pretrain용 — ShapeStacks 등 중앙 정렬 안 된 데이터)"""
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+
 def get_tta_transforms(img_size=384):
     norm = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     crop = int(img_size * 0.9)

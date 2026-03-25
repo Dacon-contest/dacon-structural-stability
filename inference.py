@@ -140,8 +140,12 @@ def ensemble_predict(args):
 
     # Build submission
     sub = pd.read_csv(test_csv)
-    sub["unstable_prob"] = np.clip(ens[:, 1], 1e-7, 1 - 1e-7)
-    sub["stable_prob"] = 1.0 - sub["unstable_prob"]
+    eps = 1e-7
+    sub["unstable_prob"] = np.clip(ens[:, 1], eps, 1 - eps)
+    sub["stable_prob"] = np.clip(ens[:, 0], eps, 1 - eps)
+    row_sum = sub["unstable_prob"] + sub["stable_prob"]
+    sub["unstable_prob"] /= row_sum
+    sub["stable_prob"] /= row_sum
 
     name = f"submission_{'_'.join(args.backbones)}"
     if len(args.seeds) > 1:
