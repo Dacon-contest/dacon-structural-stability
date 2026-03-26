@@ -14,6 +14,7 @@
 Usage (local 12GB):
   python train.py --backbone eva02_large --stage pretrain
   python train.py --backbone eva02_large --stage finetune --fold 0
+  python local_train_v1.py --backbone convnext_small --stage finetune --fold 0 --no_mixup --bb_lr 2e-5 --warmup_epochs 3
 
 Usage (Colab A100):
   python train.py --backbone eva_giant --stage both --include_dev --grad_checkpointing
@@ -56,22 +57,55 @@ from models import (
 
 import torch.multiprocessing as _mp
 
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+
 
 def _configure_sharing_strategy():
     preferred = os.environ.get("DACON_SHARING_STRATEGY")
-    candidates = [preferred] if preferred else ["file_descriptor", "file_system"]
+    if preferred:
+        candidates = [preferred]
+    else:
+        # Colab/Jupyter Linux containers often do not support the socket-based
+        # resource sharer used by file_descriptor, which causes OSError 38.
+        in_notebook = any(
+            key in os.environ
+            for key in ["COLAB_RELEASE_TAG", "JPY_PARENT_PID", "KAGGLE_KERNEL_RUN_TYPE"]
+        )
+        if os.name == "nt":
+            candidates = ["file_system"]
+        elif in_notebook:
+            candidates = ["file_system", "file_descriptor"]
+        else:
+            candidates = ["file_descriptor", "file_system"]
     for strategy in candidates:
         if not strategy:
             continue
         try:
             _mp.set_sharing_strategy(strategy)
             return strategy
-        except RuntimeError:
+        except (RuntimeError, AssertionError):
             continue
     return None
 
 
 _ACTIVE_SHARING_STRATEGY = _configure_sharing_strategy()
+
+
+def _test_shm():
+    """DataLoader 워커에 필요한 공유 메모리 동작 테스트"""
+    try:
+        t = torch.tensor([0.0])
+        t.share_memory_()
+        return True
+    except (RuntimeError, OSError):
+        return False
+
+
+_SHM_OK = _test_shm()
+if not _SHM_OK:
+    print("[WARN] 공유 메모리 사용 불가 — DataLoader num_workers=0으로 자동 전환됩니다")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -226,11 +260,41 @@ def log_row(path, row):
 def unpack_batch(batch, device):
     if len(batch) == 3:
         fr, tp, lb = batch
-        return fr.to(device), tp.to(device), None, None, lb.to(device)
+        return (
+            fr.to(device, non_blocking=True),
+            tp.to(device, non_blocking=True),
+            None,
+            None,
+            lb.to(device, non_blocking=True),
+        )
     if len(batch) == 5:
         fr, tp, vf, vm, lb = batch
-        return fr.to(device), tp.to(device), vf.to(device), vm.to(device), lb.to(device)
+        return (
+            fr.to(device, non_blocking=True),
+            tp.to(device, non_blocking=True),
+            vf.to(device, non_blocking=True),
+            vm.to(device, non_blocking=True),
+            lb.to(device, non_blocking=True),
+        )
     raise ValueError(f"Unexpected batch len {len(batch)}")
+
+
+def make_loader(dataset, batch_size, shuffle=False, sampler=None,
+                num_workers=0, drop_last=False):
+    if num_workers > 0 and not _SHM_OK:
+        num_workers = 0
+    kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle if sampler is None else False,
+        "sampler": sampler,
+        "num_workers": num_workers,
+        "pin_memory": True,
+        "drop_last": drop_last,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = os.name != "nt"  # Windows에서 hang 방지
+        kwargs["prefetch_factor"] = 4
+    return DataLoader(dataset, **kwargs)
 
 
 # =========================================================================
@@ -430,10 +494,12 @@ def pretrain(args):
             # items are already transformed by the original dataset
             return item
 
-    train_loader = DataLoader(train_sub, batch_size=bs, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_sub, batch_size=bs, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True)
+    train_loader = make_loader(
+        train_sub, batch_size=bs, shuffle=True,
+        num_workers=args.num_workers, drop_last=True)
+    val_loader = make_loader(
+        val_sub, batch_size=bs, shuffle=False,
+        num_workers=args.num_workers)
 
     print(f"  Total: {n}  train: {len(train_sub)}  val: {len(val_sub)}")
 
@@ -612,23 +678,27 @@ def finetune(args):
         is_balanced = len(counts) == 2 and abs(counts[0] - counts[1]) / max(counts) < 0.1
 
         if is_balanced or args.merge_dev:
-            train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
-                                      num_workers=args.num_workers, pin_memory=True, drop_last=True)
+            train_loader = make_loader(
+                train_ds, batch_size=bs, shuffle=True,
+                num_workers=args.num_workers, drop_last=True)
         else:
             wts = 1.0 / counts
             sw = wts[trn_labels]
             sampler = WeightedRandomSampler(sw, len(sw), replacement=True)
-            train_loader = DataLoader(train_ds, batch_size=bs, sampler=sampler,
-                                      num_workers=args.num_workers, pin_memory=True, drop_last=True)
+            train_loader = make_loader(
+                train_ds, batch_size=bs, sampler=sampler,
+                num_workers=args.num_workers, drop_last=True)
 
-        val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False,
-                                num_workers=args.num_workers, pin_memory=True)
+        val_loader = make_loader(
+            val_ds, batch_size=bs, shuffle=False,
+            num_workers=args.num_workers)
         dev_loader = None
         if dev_samples:
             dev_ds = DaconDualViewDataset(dev_samples, get_val_transforms(img_size),
                                            use_video=args.use_video, num_video_frames=args.num_video_frames)
-            dev_loader = DataLoader(dev_ds, batch_size=bs, shuffle=False,
-                                    num_workers=args.num_workers, pin_memory=True)
+            dev_loader = make_loader(
+                dev_ds, batch_size=bs, shuffle=False,
+                num_workers=args.num_workers)
 
         # Model (head_type 지원)
         model = build_model(args.backbone, pretrained=True, num_classes=2,

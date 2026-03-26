@@ -48,6 +48,10 @@ from albumentations.pytorch import ToTensorV2
 import torch.multiprocessing as _mp
 _mp.set_sharing_strategy("file_system")
 
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 SAVE_DIR = os.path.join(BASE_DIR, "checkpoints")
@@ -138,7 +142,7 @@ def predict(model, loader, device):
     all_probs, all_ids = [], []
     for fr, tp, ids in tqdm(loader, desc="Predict", leave=False):
         with autocast("cuda"):
-            logits = model(fr.to(device), tp.to(device))
+            logits = model(fr.to(device, non_blocking=True), tp.to(device, non_blocking=True))
         all_probs.append(F.softmax(logits.float(), dim=1).cpu().numpy())
         all_ids.extend(ids)
     return np.concatenate(all_probs), all_ids
@@ -152,7 +156,11 @@ def predict_tta(model, csv_path, data_dir, img_size, device,
     all_probs, all_ids = [], None
     for ftf, ttf in zip(front_ttas, top_ttas):
         ds = DualCropDataset(csv_path, data_dir, ftf, ttf)
-        loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=True)
+        loader_kwargs = {"batch_size": bs, "shuffle": False, "num_workers": nw, "pin_memory": True}
+        if nw > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 4
+        loader = DataLoader(ds, **loader_kwargs)
         probs, ids = predict(model, loader, device)
         all_probs.append(probs)
         if all_ids is None:
@@ -230,7 +238,11 @@ def ensemble_predict(args):
         else:
             ftf, ttf = make_dual_transforms(img_size, args.front_crop, args.top_crop)
             ds = DualCropDataset(test_csv, test_dir, ftf, ttf)
-            loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=True)
+            loader_kwargs = {"batch_size": bs, "shuffle": False, "num_workers": nw, "pin_memory": True}
+            if nw > 0:
+                loader_kwargs["persistent_workers"] = True
+                loader_kwargs["prefetch_factor"] = 4
+            loader = DataLoader(ds, **loader_kwargs)
             probs, ids = predict(model, loader, device)
 
         all_preds.append(probs)

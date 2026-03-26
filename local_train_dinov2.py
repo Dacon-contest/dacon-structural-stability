@@ -1,57 +1,91 @@
 """
-local_train_v1.py — 로컬 학습 & 시각화 (Windows + 12GB GPU)
+local_train_dinov2.py — DINOv2 로컬 학습 & 추론 & 시각화 (Windows + 12GB GPU)
 
 사용법:
-  python local_train_v1.py train --fold 0           # 학습 시작
-  python local_train_v1.py train --fold 0 --resume  # 이어서 학습
-  python local_train_v1.py train                    # 전체 5-fold
-  python local_train_v1.py preview --fold 0         # test 15장 시각화
-  python local_train_v1.py preview --fold 0 --split dev   # dev 정답 비교
-  python local_train_v1.py preview --fold 0 -n 30 --random
+  python local_train_dinov2.py train --fold 0              # 학습
+  python local_train_dinov2.py train --fold 0 --resume     # 이어서 학습
+  python local_train_dinov2.py train --fold 0 --continue_best
+  python local_train_dinov2.py train                       # 전체 5-fold
+  python local_train_dinov2.py infer                       # 추론 + 제출 파일 생성
+  python local_train_dinov2.py preview --fold 0            # test 15장 Grad-CAM
+  python local_train_dinov2.py preview --fold 0 --split dev
+  python local_train_dinov2.py preview --fold 0 -n 30 --random
 """
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  학습 CONFIG                                                       ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
 # ── 백본 ─────────────────────────────────────────────────────────────
-BACKBONE = "convnext_small"      # convnext_small | eva02_large | dinov2_large | eva_giant
+BACKBONE = "dinov2_large"        # dinov2_large (336px, 304M params)
 
 # ── 학습 설정 ────────────────────────────────────────────────────────
-EPOCHS          = 10             # 총 에폭 수
-PATIENCE        = 10             # early stop patience
+EPOCHS          = 15             # 총 에폭 수
+PATIENCE        = 15             # early stop patience
 SEED            = 42
 
-# ── 하이퍼파라미터 ───────────────────────────────────────────────────
-HEAD_LR         = 2e-4           # Head 학습률
-BB_LR           = 2e-5           # Backbone 학습률
-WEIGHT_DECAY    = 0.01           # weight decay (ViT: 0.05 권장)
+# ── 하이퍼파라미터 (DINOv2-L 최적화) ─────────────────────────────────
+HEAD_LR         = 1e-4           # Head 학습률
+BB_LR           = 1e-5           # Backbone 학습률 (자기지도 pretrain → 보수적)
+WEIGHT_DECAY    = 0.05           # weight decay (ViT 권장 0.05)
 DROP_RATE       = 0.3            # dropout rate
-WARMUP_EPOCHS   = 3              # warmup 에폭 (0이면 OFF)
-LAYER_DECAY     = None           # ViT LLRD (dinov2: 0.75, eva02: 0.8, eva_giant: 0.9)
+WARMUP_EPOCHS   = 2              # warmup 에폭
+LAYER_DECAY     = 0.75           # DINOv2 LLRD (층별 학습률 감소)
 
 # ── 학습 전략 ────────────────────────────────────────────────────────
 LOSS            = "ce"           # ce | focal
 SCHEDULER       = "cosine"       # cosine | cosine_wr
-NO_MIXUP        = False          # True = Mixup/CutMix 끄기
-SIMPLE_AUG      = False          # True = 단순 증강 (CenterCrop 없는 가벼운 증강)
-MERGE_DEV       = False          # True = train+dev 1100개 합쳐서 K-Fold
+NO_MIXUP        = True           # True = Mixup/CutMix 끄기
+SIMPLE_AUG      = True           # True = 단순 증강
+MERGE_DEV       = True           # True = train+dev 1100개 합쳐서 K-Fold
 
 # ── 하드웨어 (12GB GPU 기준) ─────────────────────────────────────────
-BATCH_SIZE      = 12             # 배치 크기 (VRAM에 맞게 조절)
-GRAD_ACCUM      = 2              # gradient accumulation (eff_bs = BATCH_SIZE × GRAD_ACCUM)
+BATCH_SIZE      = 2              # DINOv2-L 336px → 12GB에서 bs=2
+GRAD_ACCUM      = 16             # gradient accumulation (eff_bs = 2×16 = 32)
 NUM_WORKERS     = 4              # DataLoader 워커 수
-GRAD_CKPT       = False          # Gradient checkpointing (VRAM 부족 시 True)
+GRAD_CKPT       = True           # Gradient checkpointing (304M → 필수)
 
 # ── 기타 ─────────────────────────────────────────────────────────────
 HEAD_TYPE       = "simple"       # simple | attn_gate
 USE_VIDEO       = False
 
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  추론 CONFIG                                                       ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# --- 모델/Fold 설정 ---
+INFER_FOLDS = [0, 1, 2, 3, 4]   # fold 번호로 자동 탐색
+INFER_CHECKPOINT = None          # 직접 지정 시: ["dinov2_large_fold0.pth"]
+
+# --- 앙상블 ---
+# "majority_best": 다수결 방향 → 해당 방향 모델 중 best loss 확률 사용 (기본)
+# "mean": 단순 평균
+ENSEMBLE_METHOD  = "majority_best"
+
+# --- Dual-Crop ---
+FRONT_CROP = 0.9                 # Front view CenterCrop 비율
+TOP_CROP   = 0.7                 # Top view CenterCrop 비율
+
+# --- TTA ---
+USE_TTA = True                   # Test-Time Augmentation (4가지 변환)
+
+# --- Power Sharpening ---
+ALPHA = 1.0                      # alpha > 1: 날카롭게 | 1.0: 미적용
+
+# ════════════════════════════════════════════════════════════════════════
+
 import argparse
+import datetime
 import os
 import random
 import sys
 
 import cv2
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast
+from torch.utils.data import DataLoader
 
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
@@ -61,12 +95,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 from train_v2 import pretrain, finetune  # noqa: E402
-from models import build_model, get_backbone_config, get_backbone_choices  # noqa: E402
-from inference_v2 import make_dual_transforms  # noqa: E402
+from models import (build_model, get_backbone_config,  # noqa: E402
+                    get_train_preset, enable_gradient_checkpointing)
+from inference_v2 import (make_dual_transforms, make_dual_tta_transforms,  # noqa: E402
+                          DualCropDataset, predict, predict_tta)
 
 DATA_DIR = os.path.join(BASE_DIR, "data")
 SAVE_DIR = os.path.join(BASE_DIR, "checkpoints")
 PREVIEW_DIR = os.path.join(BASE_DIR, "previews")
+OUTPUT_DIR = os.path.join(BASE_DIR, "submissions")
 
 
 # =====================================================================
@@ -75,8 +112,8 @@ PREVIEW_DIR = os.path.join(BASE_DIR, "previews")
 def _to_spatial(feat, backbone_key, img_size):
     """Feature map → NCHW spatial format"""
     if feat.dim() == 4:
-        return feat  # ConvNeXt: already NCHW
-    # ViT: (B, T, D) → (B, D, H, W)
+        return feat
+    # DINOv2 (reg4): 1 CLS + 4 register = 5 prefix tokens
     n_prefix = 5 if "dinov2" in backbone_key else 1
     patches = feat[:, n_prefix:, :]
     grid = img_size // 14
@@ -139,9 +176,8 @@ def _compute_gradcam(model, front_t, top_t, backbone_key, img_size, target_class
 # Train
 # =====================================================================
 def cmd_train(cli_args):
-    """CONFIG 값을 train_v2.finetune()가 기대하는 namespace로 변환 후 실행"""
+    """CONFIG → train_v2.finetune() namespace 변환 후 실행"""
     args = argparse.Namespace(
-        # CONFIG에서 가져오기
         backbone=BACKBONE,
         finetune_epochs=EPOCHS,
         patience=PATIENCE,
@@ -164,11 +200,9 @@ def cmd_train(cli_args):
         head_type=HEAD_TYPE,
         use_video=USE_VIDEO,
         num_video_frames=5,
-        # CLI에서만 설정하는 것들
         fold=cli_args.fold,
         resume=cli_args.resume,
         init_from_best=cli_args.continue_best,
-        # 고정값
         stage="finetune",
         n_folds=5,
         pretrain_epochs=15,
@@ -180,7 +214,6 @@ def cmd_train(cli_args):
         skip_completed=False,
     )
 
-    # GPU 정보
     if torch.cuda.is_available():
         gpu = torch.cuda.get_device_name(0)
         vram = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -188,12 +221,13 @@ def cmd_train(cli_args):
 
     eff = BATCH_SIZE * GRAD_ACCUM
     print(f"┌──────────────────────────────────────────────┐")
-    print(f"│  {BACKBONE}")
+    print(f"│  {BACKBONE} (DINOv2 ViT-L, 304M)")
     print(f"│  epochs={EPOCHS}  bs={BATCH_SIZE}×{GRAD_ACCUM}={eff}  fold={cli_args.fold}")
     print(f"│  head_lr={HEAD_LR:.1e}  bb_lr={BB_LR:.1e}  wd={WEIGHT_DECAY}")
-    print(f"│  drop={DROP_RATE}  warmup={WARMUP_EPOCHS}  layer_decay={LAYER_DECAY}")
+    print(f"│  drop={DROP_RATE}  warmup={WARMUP_EPOCHS}  LLRD={LAYER_DECAY}")
     print(f"│  loss={LOSS}  mixup={'OFF' if NO_MIXUP else 'ON'}  sched={SCHEDULER}")
     print(f"│  merge_dev={MERGE_DEV}  aug={'simple' if SIMPLE_AUG else 'full'}")
+    print(f"│  grad_ckpt={GRAD_CKPT}  workers={NUM_WORKERS}")
     if cli_args.resume:
         print(f"│  ★ RESUME: optimizer/scheduler 이어받기")
     if cli_args.continue_best:
@@ -204,11 +238,160 @@ def cmd_train(cli_args):
 
 
 # =====================================================================
+# Inference — 추론 + 제출 파일 생성
+# =====================================================================
+def cmd_infer(cli_args):
+    """Fold 앙상블 추론 → 제출 CSV 생성"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    test_csv = os.path.join(DATA_DIR, "open", "sample_submission.csv")
+    test_dir = os.path.join(DATA_DIR, "open", "test")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    cfg = get_backbone_config(BACKBONE)
+    img_size = cfg["img_size"]
+    preset = get_train_preset(BACKBONE)
+    bs = preset["batch_size"] * 2
+
+    # --- 체크포인트 수집 ---
+    ckpt_list = []
+    if INFER_CHECKPOINT:
+        ckpts = INFER_CHECKPOINT if isinstance(INFER_CHECKPOINT, list) else [INFER_CHECKPOINT]
+        for c in ckpts:
+            p = os.path.join(SAVE_DIR, c)
+            if os.path.exists(p):
+                ckpt_list.append((p, c))
+            else:
+                print(f"  [WARN] 체크포인트 없음: {p}")
+    else:
+        for fold in INFER_FOLDS:
+            p = os.path.join(SAVE_DIR, f"{BACKBONE}_fold{fold}.pth")
+            if os.path.exists(p):
+                ckpt_list.append((p, f"{BACKBONE}_fold{fold}"))
+            else:
+                print(f"  [WARN] 체크포인트 없음: {p}")
+
+    if not ckpt_list:
+        print("[ERROR] 사용 가능한 체크포인트가 없습니다!")
+        return
+
+    print(f"{'='*60}")
+    print(f"추론 설정")
+    print(f"  백본: {BACKBONE} | 이미지: {img_size}px | 배치: {bs}")
+    print(f"  Front crop: {FRONT_CROP} | Top crop: {TOP_CROP}")
+    print(f"  TTA: {USE_TTA} | Alpha: {ALPHA}")
+    print(f"  앙상블: {ENSEMBLE_METHOD} | 모델 수: {len(ckpt_list)}")
+    for _, label in ckpt_list:
+        print(f"    - {label}")
+    print(f"{'='*60}\n")
+
+    # --- Fold별 val_logloss 읽기 (majority_best에 사용) ---
+    fold_losses = {}  # label → best_val_logloss
+    for _, label in ckpt_list:
+        log_csv = os.path.join(SAVE_DIR, f"{label}_log.csv")
+        if os.path.exists(log_csv):
+            log_df = pd.read_csv(log_csv)
+            fold_losses[label] = log_df["val_logloss"].min()
+            print(f"  {label}: best_val_logloss={fold_losses[label]:.6f}")
+        else:
+            fold_losses[label] = float("inf")
+            print(f"  {label}: log 없음 (val_logloss=inf)")
+
+    # --- 모델별 추론 ---
+    all_preds = []
+    all_labels = []
+
+    for ckpt_path, label in ckpt_list:
+        print(f"\n▶ Loading: {label}")
+        model = build_model(BACKBONE, pretrained=False, num_classes=2,
+                            drop_rate=0.0, head_type=HEAD_TYPE)
+        saved = torch.load(ckpt_path, map_location=device, weights_only=True)
+        model_sd = model.state_dict()
+        filtered = {k: v for k, v in saved.items()
+                    if k in model_sd and v.shape == model_sd[k].shape}
+        model.load_state_dict(filtered, strict=False)
+        model = model.to(device)
+
+        nw = NUM_WORKERS
+        if USE_TTA:
+            probs, ids = predict_tta(model, test_csv, test_dir, img_size, device,
+                                     FRONT_CROP, TOP_CROP, bs=bs, nw=nw)
+        else:
+            ftf, ttf = make_dual_transforms(img_size, FRONT_CROP, TOP_CROP)
+            ds = DualCropDataset(test_csv, test_dir, ftf, ttf)
+            loader = DataLoader(ds, batch_size=bs, shuffle=False,
+                                num_workers=nw, pin_memory=True)
+            probs, ids = predict(model, loader, device)
+
+        all_preds.append(probs)
+        all_labels.append(label)
+
+        _print_distribution(label, probs[:, 1])
+
+        del model
+        torch.cuda.empty_cache()
+
+    # --- 앙상블 ---
+    print(f"\n{'='*60}")
+    print(f"앙상블 결합 ({ENSEMBLE_METHOD})")
+    print(f"{'='*60}")
+
+    if ENSEMBLE_METHOD == "majority_best":
+        ens = _majority_best_ensemble(all_preds, all_labels, fold_losses)
+    else:
+        ens = np.mean(all_preds, axis=0)
+
+    p_unstable_orig = ens[:, 1]
+    _print_distribution("앙상블 결과", p_unstable_orig)
+
+    # --- Power Sharpening ---
+    if ALPHA != 1.0:
+        p_unstable_sharp = _power_sharpen(p_unstable_orig, ALPHA)
+        _print_distribution(f"Alpha={ALPHA} 보정 후", p_unstable_sharp)
+        p_unstable_final = p_unstable_sharp
+    else:
+        print(f"\n  Alpha=1.0 → Power Sharpening 미적용 (원본 그대로)")
+        p_unstable_final = p_unstable_orig
+
+    # --- 제출 파일 ---
+    sub = pd.read_csv(test_csv, encoding='utf-8-sig')
+    eps = 1e-7
+    sub["unstable_prob"] = np.clip(p_unstable_final, eps, 1 - eps)
+    sub["stable_prob"] = 1.0 - sub["unstable_prob"]
+
+    tag = BACKBONE
+    if INFER_CHECKPOINT:
+        ckpt_tag = '_'.join(os.path.splitext(os.path.basename(c))[0]
+                            for c in (INFER_CHECKPOINT if isinstance(INFER_CHECKPOINT, list) else [INFER_CHECKPOINT]))
+        tag = ckpt_tag
+    else:
+        if len(INFER_FOLDS) < 5:
+            tag += f"_f{''.join(str(f) for f in INFER_FOLDS)}"
+        else:
+            tag += "_5fold"
+    tta_tag = "_tta" if USE_TTA else ""
+    alpha_tag = f"_a{str(ALPHA).replace('.', '')}" if ALPHA != 1.0 else ""
+    ts = datetime.datetime.now().strftime("%m%d_%H%M")
+    out_name = f"submission_{tag}{tta_tag}{alpha_tag}_{ts}.csv"
+    out_path = os.path.join(OUTPUT_DIR, out_name)
+
+    sub[["id", "unstable_prob", "stable_prob"]].to_csv(out_path, index=False)
+
+    print(f"\n{'='*60}")
+    print(f"제출 파일 저장 완료")
+    print(f"{'='*60}")
+    print(f"  파일: {out_name}")
+    print(f"  경로: {out_path}")
+    print(f"  샘플 수: {len(sub)}")
+    print(f"  unstable_prob: mean={sub['unstable_prob'].mean():.10f}")
+    print(f"  unstable_prob: std ={sub['unstable_prob'].std():.10f}")
+    print(f"  예측 unstable: {(sub['unstable_prob'] > 0.5).sum()}개")
+    print(f"  예측 stable:   {(sub['unstable_prob'] <= 0.5).sum()}개")
+
+
+# =====================================================================
 # Preview — Grad-CAM 주목 영역 + 추론 확률 시각화
 # =====================================================================
 def cmd_preview(cli_args):
-    import pandas as pd
-
     backbone = BACKBONE
     fold = cli_args.fold
     cfg = get_backbone_config(backbone)
@@ -219,7 +402,7 @@ def cmd_preview(cli_args):
     ckpt_path = os.path.join(SAVE_DIR, f"{backbone}{sfx}_fold{fold}.pth")
     if not os.path.exists(ckpt_path):
         print(f"[ERROR] 체크포인트 없음: {ckpt_path}")
-        print(f"  먼저 학습: python local_train_v1.py train --fold {fold}")
+        print(f"  먼저 학습: python local_train_dinov2.py train --fold {fold}")
         return
 
     model = build_model(backbone, pretrained=False, num_classes=2, drop_rate=0.0,
@@ -251,7 +434,7 @@ def cmd_preview(cli_args):
     else:
         indices = list(range(n))
 
-    front_tf, top_tf = make_dual_transforms(img_size, front_crop_ratio=0.9, top_crop_ratio=0.7)
+    front_tf, top_tf = make_dual_transforms(img_size, front_crop_ratio=FRONT_CROP, top_crop_ratio=TOP_CROP)
 
     tag = f"{backbone}_fold{fold}_{split}"
     out_dir = os.path.join(PREVIEW_DIR, tag)
@@ -278,7 +461,7 @@ def cmd_preview(cli_args):
         front_t = front_tf(image=front_rgb)["image"].unsqueeze(0).to(device)
         top_t = top_tf(image=top_rgb)["image"].unsqueeze(0).to(device)
 
-        # ── 1. 정확한 추론 확률 (no_grad) ──
+        # 1. 추론 확률
         with torch.no_grad():
             logits = model(front_t, top_t)
         probs = F.softmax(logits.float(), dim=1).cpu().numpy()[0]
@@ -286,7 +469,7 @@ def cmd_preview(cli_args):
         pred_label = "unstable" if pred_class == 1 else "stable"
         confidence = probs[pred_class]
 
-        # ── 2. Grad-CAM 히트맵 ──
+        # 2. Grad-CAM 히트맵
         try:
             cam_f, cam_t, gate = _compute_gradcam(
                 model, front_t, top_t, backbone, img_size, pred_class)
@@ -294,7 +477,7 @@ def cmd_preview(cli_args):
             print(f"  [WARN] Grad-CAM 실패 ({sid}): {e}")
             cam_f = cam_t = gate = None
 
-        # ── 3. 결과 기록 ──
+        # 3. 결과 기록
         if has_label:
             true_label = row["label"]
             correct = pred_label == true_label
@@ -308,7 +491,7 @@ def cmd_preview(cli_args):
             "p_stable": probs[0], "p_unstable": probs[1],
         })
 
-        # ── 4. 콘솔 출력 (소숫점 10자리) ──
+        # 4. 콘솔 출력 (소숫점 10자리)
         line = (f"  {i+1:03d} {sid}: "
                 f"stable={probs[0]:.10f}  unstable={probs[1]:.10f}  "
                 f"-> {pred_label}")
@@ -319,7 +502,7 @@ def cmd_preview(cli_args):
             line += f"  GT={true_label} {mark}"
         print(line)
 
-        # ── 5. 이미지: [Front+CAM | Top+CAM | 정보 패널] ──
+        # 5. 이미지: [Front+CAM | Top+CAM | 정보 패널]
         h = 256
         panel_w = 300
         front_show = cv2.resize(front_raw, (h, h))
@@ -329,35 +512,29 @@ def cmd_preview(cli_args):
             front_show = _overlay_cam(front_show, cam_f)
             top_show = _overlay_cam(top_show, cam_t)
 
-        # 정보 패널
         panel = np.ones((h, panel_w, 3), dtype=np.uint8) * 245
-
         pred_color = (0, 0, 200) if pred_label == "unstable" else (0, 160, 0)
         cv2.putText(panel, pred_label.upper(), (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, pred_color, 2)
         cv2.putText(panel, f"{confidence:.1%}", (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 80, 80), 1)
 
-        # 확률 바
         bar_y, bar_w = 70, panel_w - 20
         cv2.rectangle(panel, (10, bar_y), (10 + bar_w, bar_y + 16), (220, 220, 220), -1)
         cv2.rectangle(panel, (10, bar_y), (10 + int(bar_w * probs[1]), bar_y + 16),
                       (0, 0, 200), -1)
 
-        # 확률 (10자리)
         cv2.putText(panel, f"unstable {probs[1]:.10f}", (10, 108),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 180), 1)
         cv2.putText(panel, f"stable   {probs[0]:.10f}", (10, 126),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 140, 0), 1)
 
-        # 게이트 가중치 (attn_gate)
         y_cur = 150
         if gate is not None:
             cv2.putText(panel, f"gate: Front={gate[0]:.4f} Top={gate[1]:.4f}",
                         (10, y_cur), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (100, 50, 0), 1)
             y_cur += 22
 
-        # 정답 라벨
         if has_label:
             gt_color = (0, 160, 0) if correct else (0, 0, 200)
             cv2.putText(panel, f"GT: {true_label}", (10, y_cur),
@@ -369,7 +546,6 @@ def cmd_preview(cli_args):
         cv2.putText(panel, sid, (10, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
 
-        # 캔버스 조합
         canvas = np.concatenate([front_show, top_show, panel], axis=1)
         border_color = (200, 100, 0) if pred_label == "unstable" else (100, 100, 100)
         if has_label:
@@ -382,7 +558,7 @@ def cmd_preview(cli_args):
 
         cv2.imwrite(os.path.join(out_dir, f"{i+1:03d}_{sid}_{pred_label}.png"), canvas)
 
-    # ── 요약 ──
+    # 요약
     print(f"{'─'*90}")
     n_done = len(results)
     print(f"[Preview] {n_done}장 저장 -> {out_dir}")
@@ -401,6 +577,108 @@ def cmd_preview(cli_args):
         print(f"  예측 분포: stable={n_done - n_unstable} unstable={n_unstable}")
 
     _save_grid(out_dir)
+
+
+# =====================================================================
+# 유틸리티
+# =====================================================================
+def _majority_best_ensemble(all_preds, all_labels, fold_losses):
+    """다수결 방향 확인 → 해당 방향 모델 중 best loss 모델의 확률 사용.
+
+    각 샘플마다:
+      1. 모든 모델의 예측 방향(unstable/stable) 개수 세기
+      2. 다수결 방향 결정
+      3. 다수결 방향으로 예측한 모델 중 val_logloss가 가장 낮은 모델의 확률 채택
+      4. 만장일치 시에도 동일 로직 (best loss 모델 확률)
+    """
+    n_models = len(all_preds)
+    n_samples = all_preds[0].shape[0]
+    ens = np.zeros((n_samples, 2))
+
+    # val_logloss 순서로 정렬 (낮을수록 좋음)
+    losses = np.array([fold_losses.get(lbl, float("inf")) for lbl in all_labels])
+    print(f"\n  모델별 val_logloss:")
+    for lbl, loss in zip(all_labels, losses):
+        print(f"    {lbl}: {loss:.6f}")
+
+    # 각 모델의 unstable 확률 (N_models, N_samples)
+    p_unstable = np.array([pred[:, 1] for pred in all_preds])  # (M, N)
+
+    # 각 모델의 투표: unstable(1) / stable(0)
+    votes = (p_unstable > 0.5).astype(int)  # (M, N)
+    unstable_votes = votes.sum(axis=0)       # (N,)
+    majority_unstable = unstable_votes > (n_models / 2)  # True = 다수가 unstable
+
+    # 통계
+    n_unanimous_unstable = (unstable_votes == n_models).sum()
+    n_unanimous_stable = (unstable_votes == 0).sum()
+    n_split = n_samples - n_unanimous_unstable - n_unanimous_stable
+    print(f"\n  투표 결과:")
+    print(f"    만장일치 unstable: {n_unanimous_unstable}개")
+    print(f"    만장일치 stable:   {n_unanimous_stable}개")
+    print(f"    분할 투표:         {n_split}개")
+
+    for i in range(n_samples):
+        if majority_unstable[i]:
+            # 다수가 unstable → unstable로 투표한 모델 중 best loss
+            mask = votes[:, i] == 1
+        else:
+            # 다수가 stable → stable로 투표한 모델 중 best loss
+            mask = votes[:, i] == 0
+
+        # mask된 모델 중 loss가 가장 낮은 모델 선택
+        candidate_losses = np.where(mask, losses, float("inf"))
+        best_idx = candidate_losses.argmin()
+        ens[i] = all_preds[best_idx][i]
+
+    # 사용 모델 빈도
+    print(f"\n  모델별 최종 채택 빈도:")
+    for m_idx in range(n_models):
+        count = 0
+        for i in range(n_samples):
+            if majority_unstable[i]:
+                mask = votes[:, i] == 1
+            else:
+                mask = votes[:, i] == 0
+            candidate_losses = np.where(mask, losses, float("inf"))
+            if candidate_losses.argmin() == m_idx:
+                count += 1
+        print(f"    {all_labels[m_idx]}: {count}회 ({count/n_samples:.1%})")
+
+    return ens
+
+
+def _power_sharpen(p, alpha):
+    """p^α / (p^α + (1-p)^α)"""
+    p = np.clip(p, 1e-7, 1 - 1e-7)
+    q = 1.0 - p
+    pa, qa = p ** alpha, q ** alpha
+    return pa / (pa + qa)
+
+
+def _print_distribution(name, probs_unstable, decimals=10):
+    """확률 분포 상세 출력"""
+    fmt = f".{decimals}f"
+    p = probs_unstable
+    print(f"\n{'─'*60}")
+    print(f"  [{name}] 확률 분포")
+    print(f"{'─'*60}")
+    print(f"  mean   = {p.mean():{fmt}}")
+    print(f"  std    = {p.std():{fmt}}")
+    print(f"  min    = {p.min():{fmt}}")
+    print(f"  max    = {p.max():{fmt}}")
+    print(f"  median = {np.median(p):{fmt}}")
+
+    bins = [(0, 0.1), (0.1, 0.2), (0.2, 0.3), (0.3, 0.4), (0.4, 0.5),
+            (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.0)]
+    print(f"\n  구간별 분포:")
+    for lo, hi in bins:
+        cnt = np.sum((p >= lo) & (p < hi)) if hi < 1.0 else np.sum((p >= lo) & (p <= hi))
+        bar = "█" * (cnt // max(1, len(p) // 50))
+        print(f"    [{lo:.1f}~{hi:.1f}): {cnt:5d}  {bar}")
+
+    print(f"  unstable 예측 (>0.5): {(p > 0.5).sum()}개 / {len(p)}개")
+    print(f"  stable   예측 (≤0.5): {(p <= 0.5).sum()}개 / {len(p)}개")
 
 
 def _save_grid(out_dir):
@@ -427,33 +705,38 @@ def _save_grid(out_dir):
 
 
 # =====================================================================
-# CLI — 명령어는 최소한만
+# CLI
 # =====================================================================
 def main():
     p = argparse.ArgumentParser(
-        description="로컬 학습 & 시각화",
+        description="DINOv2 로컬 학습 & 추론 & 시각화",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 사용법:
-  python local_train_v1.py train --fold 0             # 학습
-  python local_train_v1.py train --fold 0 --resume    # 이어서 학습 (optimizer 포함)
-  python local_train_v1.py train --fold 0 --continue_best  # best → 추가 학습
-  python local_train_v1.py preview --fold 0            # test 15장 시각화
-  python local_train_v1.py preview --fold 0 --split dev    # dev 정답 비교
+  python local_train_dinov2.py train --fold 0              # 학습
+  python local_train_dinov2.py train --fold 0 --resume     # 이어서 학습
+  python local_train_dinov2.py train --fold 0 --continue_best
+  python local_train_dinov2.py train                       # 전체 5-fold
+  python local_train_dinov2.py infer                       # 추론 + 제출 CSV
+  python local_train_dinov2.py preview --fold 0            # test 15장 Grad-CAM
+  python local_train_dinov2.py preview --fold 0 --split dev
 
 설정 변경은 파일 상단 CONFIG 섹션 직접 수정.
 """,
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    # train: fold, resume, continue_best만
+    # train
     t = sub.add_parser("train", help="학습 (설정은 파일 상단 CONFIG)")
     t.add_argument("--fold", type=int, default=None, help="fold 번호 (미지정=전체)")
     t.add_argument("--resume", action="store_true", help="optimizer/scheduler 이어받기")
     t.add_argument("--continue_best", action="store_true", help="best 가중치 → fresh optimizer")
 
-    # preview: fold, split, n, random만
-    v = sub.add_parser("preview", help="예측 시각화 (이미지 저장)")
+    # infer
+    sub.add_parser("infer", help="추론 + 제출 파일 생성 (설정은 파일 상단 추론 CONFIG)")
+
+    # preview
+    v = sub.add_parser("preview", help="Grad-CAM 시각화 (이미지 저장)")
     v.add_argument("--fold", type=int, required=True, help="fold 번호")
     v.add_argument("--split", default="test", choices=["test", "dev", "train"])
     v.add_argument("-n", type=int, default=15, help="샘플 수 (기본: 15)")
@@ -462,6 +745,8 @@ def main():
     args = p.parse_args()
     if args.command == "train":
         cmd_train(args)
+    elif args.command == "infer":
+        cmd_infer(args)
     elif args.command == "preview":
         cmd_preview(args)
 
