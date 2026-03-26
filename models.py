@@ -19,26 +19,37 @@ BACKBONE_CONFIGS = {
         "timm_name": "eva_giant_patch14_336.m30m_ft_in22k_in1k",
         "img_size": 336,
         "tier": "a100",
+        "pass_img_size": True,
     },
     "dinov3_huge": {
         "timm_name": "vit_huge_plus_patch16_dinov3.lvd1689m",
         "img_size": 384,
         "tier": "a100",
+        "pass_img_size": True,
     },
     "siglip_so400m": {
         "timm_name": "vit_so400m_patch14_siglip_384.webli",
         "img_size": 384,
         "tier": "a100",
+        "pass_img_size": True,
     },
     "eva02_large": {
         "timm_name": "eva02_large_patch14_448.mim_m38m_ft_in22k_in1k",
         "img_size": 448,
         "tier": "local",
+        "pass_img_size": True,
     },
     "dinov2_large": {
         "timm_name": "vit_large_patch14_reg4_dinov2.lvd142m",
         "img_size": 336,
         "tier": "local",
+        "pass_img_size": True,
+    },
+    "convnext_small": {
+        "timm_name": "convnext_small.in12k_ft_in1k_384",
+        "img_size": 384,
+        "tier": "a100",
+        "pass_img_size": False,
     },
 }
 
@@ -49,6 +60,7 @@ TRAIN_PRESETS = {
     "siglip_so400m": (12, 5e-5, 2e-5, 2),   # eff 24
     "eva02_large":   (2,  5e-5, 1e-5, 16),  # eff 32
     "dinov2_large":  (2,  5e-5, 1e-5, 16),  # eff 32
+    "convnext_small": (32, 2e-4, 5e-5, 1),   # eff 32
 }
 
 
@@ -69,13 +81,15 @@ class DualViewModel(nn.Module):
         self.use_video = use_video
         self.head_type = head_type
 
-        self.backbone = timm.create_model(
-            cfg["timm_name"],
-            pretrained=pretrained,
-            num_classes=0,
-            drop_rate=drop_rate,
-            img_size=cfg["img_size"],
-        )
+        backbone_kwargs = {
+            "pretrained": pretrained,
+            "num_classes": 0,
+            "drop_rate": drop_rate,
+        }
+        if cfg.get("pass_img_size", True):
+            backbone_kwargs["img_size"] = cfg["img_size"]
+
+        self.backbone = timm.create_model(cfg["timm_name"], **backbone_kwargs)
         feat_dim = self.backbone.num_features
         self.feat_dim = feat_dim
 

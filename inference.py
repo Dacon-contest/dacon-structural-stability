@@ -32,7 +32,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 class InferDataset(Dataset):
     def __init__(self, csv_path, data_dir, transform):
-        self.df = pd.read_csv(csv_path)
+        self.df = pd.read_csv(csv_path, encoding='utf-8-sig')
         self.data_dir = data_dir
         self.transform = transform
 
@@ -139,7 +139,7 @@ def ensemble_predict(args):
         ens = e / e.sum(axis=1, keepdims=True)
 
     # Build submission
-    sub = pd.read_csv(test_csv)
+    sub = pd.read_csv(test_csv, encoding='utf-8-sig')
     eps = 1e-7
     sub["unstable_prob"] = np.clip(ens[:, 1], eps, 1 - eps)
     sub["stable_prob"] = np.clip(ens[:, 0], eps, 1 - eps)
@@ -166,7 +166,7 @@ def validate_on_dev(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dev_csv = os.path.join(DATA_DIR, "open", "dev.csv")
     dev_dir = os.path.join(DATA_DIR, "open", "dev")
-    dev_df = pd.read_csv(dev_csv)
+    dev_df = pd.read_csv(dev_csv, encoding='utf-8-sig')
 
     all_preds = []
     for bk in args.backbones:

@@ -55,7 +55,23 @@ from models import (
 )
 
 import torch.multiprocessing as _mp
-_mp.set_sharing_strategy("file_system")
+
+
+def _configure_sharing_strategy():
+    preferred = os.environ.get("DACON_SHARING_STRATEGY")
+    candidates = [preferred] if preferred else ["file_descriptor", "file_system"]
+    for strategy in candidates:
+        if not strategy:
+            continue
+        try:
+            _mp.set_sharing_strategy(strategy)
+            return strategy
+        except RuntimeError:
+            continue
+    return None
+
+
+_ACTIVE_SHARING_STRATEGY = _configure_sharing_strategy()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -74,6 +90,72 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+# =========================================================================
+# Layer-wise LR Decay (LLRD) for ViT
+# =========================================================================
+def get_vit_layer_lr_params(model, bb_lr, head_lr, layer_decay, weight_decay=0.05):
+    """Layer-wise LR decay for ViT models (EVA-Giant, DINOv2 등).
+
+    출력에 가까운 층 → 높은 LR, 입력에 가까운 층 → 낮은 LR.
+    - backbone.blocks[-1]: bb_lr * layer_decay^0 = bb_lr
+    - backbone.blocks[0]:  bb_lr * layer_decay^(N-1)
+    - patch_embed, cls_token, pos_embed: bb_lr * layer_decay^N
+    - head, attn_gate: head_lr (감쇠 없음)
+
+    bias/norm 파라미터에는 weight_decay=0 적용.
+    """
+    if not hasattr(model.backbone, 'blocks'):
+        return None  # ViT가 아니면 None 반환 → 호출 측에서 기본 2-group 사용
+
+    num_layers = len(model.backbone.blocks)
+    layer_scales = {}
+    no_decay_keywords = ["bias", "norm", "cls_token", "pos_embed"]
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Head / fusion: head_lr, 감쇠 없음
+        if any(k in name for k in ["head", "attn_gate"]):
+            layer_scales[name] = ("head", 1.0)
+            continue
+
+        # Backbone blocks: 깊이 기반 감쇠
+        if "backbone.blocks." in name:
+            block_idx = int(name.split("backbone.blocks.")[1].split(".")[0])
+            depth_from_top = num_layers - block_idx - 1
+            layer_scales[name] = ("bb", layer_decay ** depth_from_top)
+        else:
+            # patch_embed, cls_token, pos_embed, norm → 최대 감쇠
+            layer_scales[name] = ("bb", layer_decay ** num_layers)
+
+    # 파라미터 그룹 구성
+    param_groups = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        group_type, scale = layer_scales.get(name, ("bb", 1.0))
+        lr = head_lr if group_type == "head" else bb_lr * scale
+
+        # bias, norm 등 → weight decay 0
+        is_no_decay = any(kw in name for kw in no_decay_keywords)
+        wd = 0.0 if is_no_decay else weight_decay
+
+        key = (round(lr, 12), wd)
+        if key not in param_groups:
+            param_groups[key] = {"params": [], "lr": lr, "weight_decay": wd}
+        param_groups[key]["params"].append(param)
+
+    groups = list(param_groups.values())
+    n_params = sum(len(g["params"]) for g in groups)
+    lrs = sorted(set(g["lr"] for g in groups))
+    print(f"  LLRD: {len(groups)} groups, {n_params} params, "
+          f"layer_decay={layer_decay}, {num_layers} layers")
+    print(f"  LR range: {lrs[0]:.2e} ~ {lrs[-1]:.2e}")
+    return groups
 
 
 def seed_suffix(seed):
@@ -258,7 +340,7 @@ def build_dacon_samples(data_dir, include_dev=False, dev_oversample=1):
         csv_path = os.path.join(data_dir, "open", f"{split}.csv")
         if not os.path.exists(csv_path):
             continue
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, encoding='utf-8-sig')
         sd = os.path.join(data_dir, "open", split)
         for _, r in df.iterrows():
             label_int = 1 if r["label"] == "unstable" else 0
@@ -267,7 +349,7 @@ def build_dacon_samples(data_dir, include_dev=False, dev_oversample=1):
     if include_dev:
         csv_path = os.path.join(data_dir, "open", "dev.csv")
         if os.path.exists(csv_path):
-            df = pd.read_csv(csv_path)
+            df = pd.read_csv(csv_path, encoding='utf-8-sig')
             sd = os.path.join(data_dir, "open", "dev")
             for _ in range(dev_oversample):
                 for _, r in df.iterrows():
@@ -280,7 +362,7 @@ def build_dev_samples(data_dir):
     csv_path = os.path.join(data_dir, "open", "dev.csv")
     if not os.path.exists(csv_path):
         return []
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, encoding='utf-8-sig')
     sd = os.path.join(data_dir, "open", "dev")
     return [(sd, r["id"], 1 if r["label"] == "unstable" else 0) for _, r in df.iterrows()]
 
@@ -453,6 +535,8 @@ def finetune(args):
     print(f"  Loss={args.loss} | Mixup={'OFF' if args.no_mixup else 'ON'} | "
           f"Sched={args.scheduler} | Head={args.head_type}")
     print(f"  head_lr={head_lr:.1e} | bb_lr={bb_lr:.1e} | wd={wd} | drop={drop}")
+    if getattr(args, 'layer_decay', None):
+        print(f"  LLRD: layer_decay={args.layer_decay} | warmup={getattr(args, 'warmup_epochs', 0)}ep")
     if getattr(args, 'video_frame_aug', False):
         print(f"  video_frame_aug: ON (50% 확률로 front 대신 0.1초 프레임)")
     if getattr(args, 'init_from_best', False):
@@ -460,6 +544,7 @@ def finetune(args):
     if args.merge_dev:
         print(f"merge_dev: train+dev 합쳐서 K-Fold")
     print("=" * 60)
+
     # 데이터 전략 결정
     if args.merge_dev:
         # train+dev 전체 합침 → K-Fold
@@ -582,23 +667,55 @@ def finetune(args):
 
         model = model.to(device)
 
-        # Differential LR
+        # Optimizer: LLRD (layer-wise LR decay) 또는 기존 2-group
         bb_lr_scale = 0.1 if has_pretrained else 1.0
-        bb_params, head_params = [], []
-        for name, p in model.named_parameters():
-            (head_params if any(k in name for k in ["head", "attn_gate"]) else bb_params).append(p)
-        opt = torch.optim.AdamW([
-            {"params": bb_params, "lr": bb_lr * bb_lr_scale},
-            {"params": head_params, "lr": head_lr},
-        ], weight_decay=wd)
+        layer_decay = getattr(args, 'layer_decay', None)
 
-        # Scheduler
+        if layer_decay and layer_decay < 1.0:
+            # LLRD: ViT 전용 per-layer param groups
+            llrd_groups = get_vit_layer_lr_params(
+                model, bb_lr=bb_lr * bb_lr_scale, head_lr=head_lr,
+                layer_decay=layer_decay, weight_decay=wd)
+            if llrd_groups:
+                opt = torch.optim.AdamW(llrd_groups)
+            else:
+                print(f"  [WARN] LLRD not supported for {args.backbone} → 기본 2-group 사용")
+                bb_params, head_params = [], []
+                for name, p in model.named_parameters():
+                    (head_params if any(k in name for k in ["head", "attn_gate"]) else bb_params).append(p)
+                opt = torch.optim.AdamW([
+                    {"params": bb_params, "lr": bb_lr * bb_lr_scale},
+                    {"params": head_params, "lr": head_lr},
+                ], weight_decay=wd)
+        else:
+            # 기존: backbone vs head 2-group
+            bb_params, head_params = [], []
+            for name, p in model.named_parameters():
+                (head_params if any(k in name for k in ["head", "attn_gate"]) else bb_params).append(p)
+            opt = torch.optim.AdamW([
+                {"params": bb_params, "lr": bb_lr * bb_lr_scale},
+                {"params": head_params, "lr": head_lr},
+            ], weight_decay=wd)
+
+        # Scheduler (warmup 지원)
+        warmup_ep = getattr(args, 'warmup_epochs', 0)
+        remaining_ep = max(args.finetune_epochs - warmup_ep, 1)
+
         if args.scheduler == "cosine_wr":
-            sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            base_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 opt, T_0=10, T_mult=2)
         else:
-            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=args.finetune_epochs, eta_min=1e-7)
+            base_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=remaining_ep, eta_min=1e-7)
+
+        if warmup_ep > 0:
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                opt, start_factor=0.01, total_iters=warmup_ep)
+            sched = torch.optim.lr_scheduler.SequentialLR(
+                opt, [warmup_sched, base_sched], milestones=[warmup_ep])
+            print(f"  Warmup: {warmup_ep} epochs (LinearLR 0.01x → 1x)")
+        else:
+            sched = base_sched
 
         # Loss
         if args.loss == "ce":
@@ -731,6 +848,10 @@ def main():
                    help="Backbone LR 직접 지정 (미지정 시 preset 사용)")
     p.add_argument("--weight_decay", type=float, default=0.01,
                    help="Weight decay (기본 0.01)")
+    p.add_argument("--layer_decay", type=float, default=None,
+                   help="Layer-wise LR decay for ViT (EVA-Giant: 0.9, Large: 0.8)")
+    p.add_argument("--warmup_epochs", type=int, default=0,
+                   help="Linear warmup epochs (기본 0)")
     p.add_argument("--scheduler", type=str, default="cosine",
                    choices=["cosine", "cosine_wr"],
                    help="스케줄러 (cosine_wr: WarmRestarts T0=10)")

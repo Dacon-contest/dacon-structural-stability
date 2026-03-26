@@ -333,7 +333,7 @@ class ShapeStacksH6Dataset(Dataset):
 # =========================================================================
 class TestDataset(Dataset):
     def __init__(self, csv_path, data_dir, transform=None):
-        self.df = pd.read_csv(csv_path)
+        self.df = pd.read_csv(csv_path, encoding='utf-8-sig')
         self.data_dir = data_dir
         self.transform = transform
 

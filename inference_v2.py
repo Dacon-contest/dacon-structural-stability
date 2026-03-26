@@ -114,7 +114,7 @@ def make_dual_tta_transforms(img_size, front_crop_ratio=0.9, top_crop_ratio=0.7)
 class DualCropDataset(Dataset):
     """Front/Top에 서로 다른 transform 적용"""
     def __init__(self, csv_path, data_dir, front_tf, top_tf):
-        self.df = pd.read_csv(csv_path)
+        self.df = pd.read_csv(csv_path, encoding='utf-8-sig')
         self.data_dir = data_dir
         self.front_tf = front_tf
         self.top_tf = top_tf
@@ -250,7 +250,7 @@ def ensemble_predict(args):
         ens = e / e.sum(axis=1, keepdims=True)
 
     # Build submission
-    sub = pd.read_csv(test_csv)
+    sub = pd.read_csv(test_csv, encoding='utf-8-sig')
     eps = 1e-7
     sub["unstable_prob"] = np.clip(ens[:, 1], eps, 1 - eps)
     sub["stable_prob"] = np.clip(ens[:, 0], eps, 1 - eps)
@@ -287,7 +287,7 @@ def validate_on_dev(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dev_csv = os.path.join(DATA_DIR, "open", "dev.csv")
     dev_dir = os.path.join(DATA_DIR, "open", "dev")
-    dev_df = pd.read_csv(dev_csv)
+    dev_df = pd.read_csv(dev_csv, encoding='utf-8-sig')
 
     print(f"  Front crop: {args.front_crop} | Top crop: {args.top_crop}")
     print(f"  Folds: {args.folds}")
