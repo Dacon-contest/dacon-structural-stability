@@ -2,11 +2,20 @@
 local_train_dinov2.py — DINOv2 로컬 학습 & 추론 & 시각화 (Windows + 12GB GPU)
 
 사용법:
-  python local_train_dinov2.py train --fold 0              # 학습
+  # 학습
+  python local_train_dinov2.py train --fold 0              # fold 0 학습
   python local_train_dinov2.py train --fold 0 --resume     # 이어서 학습
   python local_train_dinov2.py train --fold 0 --continue_best
-  python local_train_dinov2.py train                       # 전체 5-fold
-  python local_train_dinov2.py infer                       # 추론 + 제출 파일 생성
+  python local_train_dinov2.py train                       # 전체 5-fold 순차 학습
+  python local_train_dinov2.py train --fold 1 && python local_train_dinov2.py train --fold 2 && python local_train_dinov2.py train --fold 3 && python local_train_dinov2.py train --fold 4
+
+  # 추론 (5-fold 앙상블 → 제출 CSV)
+  python local_train_dinov2.py infer                       # 다수결+best loss 앙상블
+  #   앙상블 방식: ENSEMBLE_METHOD 설정 참고
+  #   - "majority_best": 다수결 방향 → 해당 방향 모델 중 best val_logloss 확률 사용
+  #   - "mean": 단순 평균 (비권장)
+
+  # 시각화 (Grad-CAM)
   python local_train_dinov2.py preview --fold 0            # test 15장 Grad-CAM
   python local_train_dinov2.py preview --fold 0 --split dev
   python local_train_dinov2.py preview --fold 0 -n 30 --random
@@ -45,7 +54,9 @@ NUM_WORKERS     = 4              # DataLoader 워커 수
 GRAD_CKPT       = True           # Gradient checkpointing (304M → 필수)
 
 # ── 기타 ─────────────────────────────────────────────────────────────
-HEAD_TYPE       = "simple"       # simple | attn_gate
+HEAD_TYPE       = "cross_attn"   # simple | attn_gate | cross_attn (token-level fusion)
+FUSION_LAYERS   = 4              # Cross-view transformer layers (cross_attn용)
+FUSION_HEADS    = 8              # Attention heads in fusion
 USE_VIDEO       = False
 
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -59,11 +70,11 @@ INFER_CHECKPOINT = None          # 직접 지정 시: ["dinov2_large_fold0.pth"]
 # --- 앙상블 ---
 # "majority_best": 다수결 방향 → 해당 방향 모델 중 best loss 확률 사용 (기본)
 # "mean": 단순 평균
-ENSEMBLE_METHOD  = "majority_best"
+ENSEMBLE_METHOD  = "mean"
 
 # --- Dual-Crop ---
 FRONT_CROP = 0.9                 # Front view CenterCrop 비율
-TOP_CROP   = 0.7                 # Top view CenterCrop 비율
+TOP_CROP   = 0.9                 # Top view CenterCrop 비율 (학습과 동일)
 
 # --- TTA ---
 USE_TTA = True                   # Test-Time Augmentation (4가지 변환)
@@ -132,16 +143,16 @@ def _build_cam(spatial, grad):
     return cam
 
 
-def _overlay_cam(img_bgr, cam, alpha=0.45):
-    """Grad-CAM heatmap을 이미지 위에 오버레이"""
+def _overlay_cam(img_bgr, cam, alpha=0.35):
+    """Grad-CAM / Attention heatmap을 이미지 위에 오버레이"""
     h, w = img_bgr.shape[:2]
     cam_resized = cv2.resize(cam, (w, h), interpolation=cv2.INTER_LINEAR)
-    heatmap = cv2.applyColorMap(np.uint8(cam_resized * 255), cv2.COLORMAP_JET)
+    heatmap = cv2.applyColorMap(np.uint8(cam_resized * 255), cv2.COLORMAP_INFERNO)
     return cv2.addWeighted(img_bgr, 1 - alpha, heatmap, alpha, 0)
 
 
 def _compute_gradcam(model, front_t, top_t, backbone_key, img_size, target_class):
-    """Dual-view Grad-CAM 계산"""
+    """Dual-view Grad-CAM 계산 (simple/attn_gate 전용)"""
     bb = model.backbone
     with torch.enable_grad():
         feat_f = bb.forward_features(front_t)
@@ -152,15 +163,17 @@ def _compute_gradcam(model, front_t, top_t, backbone_key, img_size, target_class
         sp_f.retain_grad()
         sp_t.retain_grad()
 
-        vec_f = sp_f.mean(dim=(2, 3))
-        vec_t = sp_t.mean(dim=(2, 3))
-
         gate_weights = None
+
         if model.head_type == "attn_gate":
+            vec_f = sp_f.mean(dim=(2, 3))
+            vec_t = sp_t.mean(dim=(2, 3))
             gate = model.attn_gate(torch.cat([vec_f, vec_t], dim=1))
             fused = gate[:, 0:1] * vec_f + gate[:, 1:2] * vec_t
             gate_weights = gate[0].detach().cpu().numpy()
         else:
+            vec_f = sp_f.mean(dim=(2, 3))
+            vec_t = sp_t.mean(dim=(2, 3))
             fused = torch.cat([vec_f, vec_t], dim=1)
 
         logits = model.head(fused)
@@ -170,6 +183,62 @@ def _compute_gradcam(model, front_t, top_t, backbone_key, img_size, target_class
     cam_f = _build_cam(sp_f, sp_f.grad)
     cam_t = _build_cam(sp_t, sp_t.grad)
     return cam_f, cam_t, gate_weights
+
+
+def _compute_attention_rollout(model, front_t, top_t, backbone_key, img_size):
+    """Cross-view Attention Rollout 시각화.
+
+    CLS 토큰이 front/top 각 패치를 얼마나 attend하는지 계산.
+    마지막 layer의 CLS attention + 전체 rollout 블렌딩으로
+    선명하고 해석 가능한 히트맵 생성.
+
+    Returns:
+        cam_f: (H, W) front attention map (0~1)
+        cam_t: (H, W) top attention map (0~1)
+        probs: (2,) softmax 확률
+        pred_class: int
+    """
+    with torch.no_grad():
+        tok_f = model.get_patch_tokens(front_t)  # (1, Nf, D)
+        tok_t = model.get_patch_tokens(top_t)    # (1, Nt, D)
+
+        cls_out, attentions = model.fusion.forward_with_attention(tok_f, tok_t)
+        logits = model.head(cls_out)
+        probs = F.softmax(logits.float(), dim=1).cpu().numpy()[0]
+        pred_class = int(logits.argmax(1).item())
+
+    n_f = tok_f.shape[1]
+    grid = img_size // 14
+
+    # 마지막 layer의 CLS attention (가장 task-specific)
+    last_attn = attentions[-1][0].detach().mean(dim=0).cpu().float()  # (N, N)
+    last_cls = last_attn[0, 1:].numpy()
+
+    # Rollout (전체 layer 누적)
+    rollout = None
+    for attn_w in attentions:
+        attn = attn_w[0].detach().mean(dim=0).cpu().float()
+        eye = torch.eye(attn.size(0))
+        attn = 0.5 * eye + 0.5 * attn
+        attn = attn / attn.sum(dim=-1, keepdim=True)
+        rollout = attn if rollout is None else (attn @ rollout)
+    rollout_cls = rollout[0, 1:].numpy()
+
+    # 블렌딩: 70% 마지막 layer + 30% rollout
+    cls_attn = 0.7 * last_cls + 0.3 * rollout_cls
+
+    def _normalize_cam(raw):
+        # percentile clip → 상위 1% 이상은 1로 clamp (극단값 제거)
+        p99 = np.percentile(raw, 99)
+        v = np.clip(raw, raw.min(), max(p99, raw.min() + 1e-8))
+        v = v - v.min()
+        v = v / max(v.max(), 1e-8)
+        return v.reshape(grid, grid)
+
+    cam_f = _normalize_cam(cls_attn[:n_f])
+    cam_t = _normalize_cam(cls_attn[n_f:])
+
+    return cam_f, cam_t, probs, pred_class
 
 
 # =====================================================================
@@ -198,6 +267,8 @@ def cmd_train(cli_args):
         num_workers=NUM_WORKERS,
         grad_checkpointing=GRAD_CKPT,
         head_type=HEAD_TYPE,
+        fusion_layers=FUSION_LAYERS,
+        fusion_heads=FUSION_HEADS,
         use_video=USE_VIDEO,
         num_video_frames=5,
         fold=cli_args.fold,
@@ -227,6 +298,7 @@ def cmd_train(cli_args):
     print(f"│  drop={DROP_RATE}  warmup={WARMUP_EPOCHS}  LLRD={LAYER_DECAY}")
     print(f"│  loss={LOSS}  mixup={'OFF' if NO_MIXUP else 'ON'}  sched={SCHEDULER}")
     print(f"│  merge_dev={MERGE_DEV}  aug={'simple' if SIMPLE_AUG else 'full'}")
+    print(f"│  head={HEAD_TYPE}  fusion_layers={FUSION_LAYERS}  fusion_heads={FUSION_HEADS}")
     print(f"│  grad_ckpt={GRAD_CKPT}  workers={NUM_WORKERS}")
     if cli_args.resume:
         print(f"│  ★ RESUME: optimizer/scheduler 이어받기")
@@ -303,7 +375,8 @@ def cmd_infer(cli_args):
     for ckpt_path, label in ckpt_list:
         print(f"\n▶ Loading: {label}")
         model = build_model(BACKBONE, pretrained=False, num_classes=2,
-                            drop_rate=0.0, head_type=HEAD_TYPE)
+                            drop_rate=0.0, head_type=HEAD_TYPE,
+                            fusion_layers=FUSION_LAYERS, fusion_heads=FUSION_HEADS)
         saved = torch.load(ckpt_path, map_location=device, weights_only=True)
         model_sd = model.state_dict()
         filtered = {k: v for k, v in saved.items()
@@ -406,7 +479,8 @@ def cmd_preview(cli_args):
         return
 
     model = build_model(backbone, pretrained=False, num_classes=2, drop_rate=0.0,
-                        head_type=HEAD_TYPE)
+                        head_type=HEAD_TYPE,
+                        fusion_layers=FUSION_LAYERS, fusion_heads=FUSION_HEADS)
     saved = torch.load(ckpt_path, map_location=device, weights_only=True)
     model.load_state_dict(saved, strict=False)
     model = model.to(device).eval()
@@ -441,7 +515,9 @@ def cmd_preview(cli_args):
     os.makedirs(out_dir, exist_ok=True)
 
     results = []
-    print(f"[Preview] {split} 데이터 {n}장 — Grad-CAM 시각화")
+    use_attn_rollout = (HEAD_TYPE == "cross_attn")
+    vis_method = "Attention Rollout" if use_attn_rollout else "Grad-CAM"
+    print(f"[Preview] {split} 데이터 {n}장 — {vis_method} 시각화")
     print(f"{'─'*90}")
 
     for i, idx in enumerate(indices):
@@ -461,21 +537,37 @@ def cmd_preview(cli_args):
         front_t = front_tf(image=front_rgb)["image"].unsqueeze(0).to(device)
         top_t = top_tf(image=top_rgb)["image"].unsqueeze(0).to(device)
 
-        # 1. 추론 확률
-        with torch.no_grad():
-            logits = model(front_t, top_t)
-        probs = F.softmax(logits.float(), dim=1).cpu().numpy()[0]
-        pred_class = int(logits.argmax(1).item())
-        pred_label = "unstable" if pred_class == 1 else "stable"
-        confidence = probs[pred_class]
+        cam_f = cam_t = gate = None
 
-        # 2. Grad-CAM 히트맵
-        try:
-            cam_f, cam_t, gate = _compute_gradcam(
-                model, front_t, top_t, backbone, img_size, pred_class)
-        except Exception as e:
-            print(f"  [WARN] Grad-CAM 실패 ({sid}): {e}")
-            cam_f = cam_t = gate = None
+        if use_attn_rollout:
+            # Attention Rollout: CLS → 패치 attention
+            try:
+                cam_f, cam_t, probs, pred_class = _compute_attention_rollout(
+                    model, front_t, top_t, backbone, img_size)
+                pred_label = "unstable" if pred_class == 1 else "stable"
+                confidence = probs[pred_class]
+            except Exception as e:
+                print(f"  [WARN] Attention Rollout 실패 ({sid}): {e}")
+                with torch.no_grad():
+                    logits = model(front_t, top_t)
+                probs = F.softmax(logits.float(), dim=1).cpu().numpy()[0]
+                pred_class = int(logits.argmax(1).item())
+                pred_label = "unstable" if pred_class == 1 else "stable"
+                confidence = probs[pred_class]
+        else:
+            # Grad-CAM: simple/attn_gate
+            with torch.no_grad():
+                logits = model(front_t, top_t)
+            probs = F.softmax(logits.float(), dim=1).cpu().numpy()[0]
+            pred_class = int(logits.argmax(1).item())
+            pred_label = "unstable" if pred_class == 1 else "stable"
+            confidence = probs[pred_class]
+
+            try:
+                cam_f, cam_t, gate = _compute_gradcam(
+                    model, front_t, top_t, backbone, img_size, pred_class)
+            except Exception as e:
+                print(f"  [WARN] Grad-CAM 실패 ({sid}): {e}")
 
         # 3. 결과 기록
         if has_label:
@@ -551,9 +643,11 @@ def cmd_preview(cli_args):
         if has_label:
             border_color = (0, 180, 0) if correct else (0, 0, 220)
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1]-1, canvas.shape[0]-1), border_color, 3)
-        cv2.putText(canvas, "FRONT + CAM", (5, h - 10),
+        f_label = "FRONT + ATTN" if use_attn_rollout else "FRONT + CAM"
+        t_label = "TOP + ATTN" if use_attn_rollout else "TOP + CAM"
+        cv2.putText(canvas, f_label, (5, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        cv2.putText(canvas, "TOP + CAM", (h + 5, h - 10),
+        cv2.putText(canvas, t_label, (h + 5, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
         cv2.imwrite(os.path.join(out_dir, f"{i+1:03d}_{sid}_{pred_label}.png"), canvas)
@@ -736,11 +830,11 @@ def main():
     sub.add_parser("infer", help="추론 + 제출 파일 생성 (설정은 파일 상단 추론 CONFIG)")
 
     # preview
-    v = sub.add_parser("preview", help="Grad-CAM 시각화 (이미지 저장)")
+    v = sub.add_parser("preview", help="Attention/Grad-CAM 시각화 (이미지 저장)")
     v.add_argument("--fold", type=int, required=True, help="fold 번호")
     v.add_argument("--split", default="test", choices=["test", "dev", "train"])
-    v.add_argument("-n", type=int, default=15, help="샘플 수 (기본: 15)")
-    v.add_argument("--random", action="store_true", help="랜덤 샘플링")
+    v.add_argument("-n", type=int, default=20, help="샘플 수 (기본: 20)")
+    v.add_argument("--random", action="store_true", default=True, help="랜덤 샘플링 (기본: ON)")
 
     args = p.parse_args()
     if args.command == "train":

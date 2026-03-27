@@ -2,8 +2,8 @@
 inference_v2.py — Dual-Crop + Fold Selection
 
 변경사항 (vs inference.py):
-  1. Front/Top 별도 CenterCrop 비율: front=0.9 (기본), top=0.7 (기본)
-     → Top view는 블록이 중앙에 작게 있으므로 더 aggressive crop
+  1. Front/Top 별도 CenterCrop 비율: front=0.9 (기본), top=0.9 (기본)
+     → 학습과 동일한 crop 비율 사용
   2. --folds 파라미터: 특정 fold만 선택 가능 (예: --folds 0 2)
      → 5-fold 앙상블 대신 best fold 1개만 사용 가능
   3. TTA도 front/top 별도 crop 적용
@@ -60,8 +60,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ========== Dual-Crop Transform 생성 ==========
-def make_dual_transforms(img_size, front_crop_ratio=0.9, top_crop_ratio=0.7):
-    """Front/Top에 각각 다른 CenterCrop 비율 적용"""
+def make_dual_transforms(img_size, front_crop_ratio=0.9, top_crop_ratio=0.9):
+    """Front/Top에 각각 CenterCrop 비율 적용"""
     norm = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     fc = int(img_size * front_crop_ratio)
     tc = int(img_size * top_crop_ratio)
@@ -76,7 +76,7 @@ def make_dual_transforms(img_size, front_crop_ratio=0.9, top_crop_ratio=0.7):
     return front_tf, top_tf
 
 
-def make_dual_tta_transforms(img_size, front_crop_ratio=0.9, top_crop_ratio=0.7):
+def make_dual_tta_transforms(img_size, front_crop_ratio=0.9, top_crop_ratio=0.9):
     """TTA 변환 — front/top 각각 별도 crop"""
     norm = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     fc = int(img_size * front_crop_ratio)
@@ -373,10 +373,10 @@ def main():
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--front_crop", type=float, default=0.9,
                    help="Front view CenterCrop 비율 (기본: 0.9)")
-    p.add_argument("--top_crop", type=float, default=0.7,
-                   help="Top view CenterCrop 비율 (기본: 0.7)")
+    p.add_argument("--top_crop", type=float, default=0.9,
+                   help="Top view CenterCrop 비율 (기본: 0.9)")
     p.add_argument("--head_type", type=str, default="simple",
-                   choices=["attn_gate", "simple"])
+                   choices=["attn_gate", "simple", "cross_attn"])
     p.add_argument("--validate", action="store_true", help="Dev set 검증 (fold별 성능 출력)")
     p.add_argument("--num_workers", type=int, default=4)
     args = p.parse_args()

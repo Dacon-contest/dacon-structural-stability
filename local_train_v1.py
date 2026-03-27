@@ -251,7 +251,7 @@ def cmd_preview(cli_args):
     else:
         indices = list(range(n))
 
-    front_tf, top_tf = make_dual_transforms(img_size, front_crop_ratio=0.9, top_crop_ratio=0.7)
+    front_tf, top_tf = make_dual_transforms(img_size, front_crop_ratio=0.9, top_crop_ratio=0.9)
 
     tag = f"{backbone}_fold{fold}_{split}"
     out_dir = os.path.join(PREVIEW_DIR, tag)

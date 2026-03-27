@@ -152,7 +152,7 @@ def get_vit_layer_lr_params(model, bb_lr, head_lr, layer_decay, weight_decay=0.0
             continue
 
         # Head / fusion: head_lr, 감쇠 없음
-        if any(k in name for k in ["head", "attn_gate"]):
+        if any(k in name for k in ["head", "attn_gate", "fusion"]):
             layer_scales[name] = ("head", 1.0)
             continue
 
@@ -704,7 +704,9 @@ def finetune(args):
         model = build_model(args.backbone, pretrained=True, num_classes=2,
                             drop_rate=drop, use_video=args.use_video,
                             num_video_frames=args.num_video_frames,
-                            head_type=args.head_type)
+                            head_type=args.head_type,
+                            fusion_layers=getattr(args, 'fusion_layers', 4),
+                            fusion_heads=getattr(args, 'fusion_heads', 8))
         if args.grad_checkpointing:
             enable_gradient_checkpointing(model)
 
@@ -926,8 +928,8 @@ def main():
                    choices=["cosine", "cosine_wr"],
                    help="스케줄러 (cosine_wr: WarmRestarts T0=10)")
     p.add_argument("--head_type", type=str, default="simple",
-                   choices=["attn_gate", "simple"],
-                   help="Head 구조 (simple: concat+MLP)")
+                   choices=["attn_gate", "simple", "cross_attn"],
+                   help="Head 구조 (simple: concat+MLP, cross_attn: token fusion)")
     p.add_argument("--drop_rate", type=float, default=None,
                    help="Dropout rate (미지정 시 0.3)")
     p.add_argument("--simple_aug", action="store_true",

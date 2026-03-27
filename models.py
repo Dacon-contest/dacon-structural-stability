@@ -12,6 +12,7 @@
 """
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 import timm
 
 BACKBONE_CONFIGS = {
@@ -64,17 +65,95 @@ TRAIN_PRESETS = {
 }
 
 
+class CrossViewFusion(nn.Module):
+    """Token-level cross-view fusion via Transformer with learnable [CLS] token.
+
+    [CLS] + Front patch tokens + Top patch tokens → Transformer → CLS output.
+    CLS token이 양쪽 뷰의 모든 패치를 attend하며 cross-view 관계를 학습.
+    """
+
+    def __init__(self, feat_dim, n_layers=4, n_heads=8, dropout=0.1):
+        super().__init__()
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, feat_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        self.view_embed = nn.Parameter(torch.zeros(2, 1, feat_dim))
+        nn.init.trunc_normal_(self.view_embed, std=0.02)
+
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=feat_dim, nhead=n_heads,
+                dim_feedforward=feat_dim * 4,
+                dropout=dropout, activation='gelu',
+                batch_first=True, norm_first=True,
+            ) for _ in range(n_layers)
+        ])
+        self.norm = nn.LayerNorm(feat_dim)
+        self.grad_ckpt = False
+        self.n_heads = n_heads
+
+    def _build_sequence(self, front_tokens, top_tokens):
+        """[CLS] + front(+view_embed) + top(+view_embed) → (B, 1+Nf+Nt, D)"""
+        B = front_tokens.shape[0]
+        cls = self.cls_token.expand(B, -1, -1)
+        front_tokens = front_tokens + self.view_embed[0]
+        top_tokens = top_tokens + self.view_embed[1]
+        return torch.cat([cls, front_tokens, top_tokens], dim=1)
+
+    def forward(self, front_tokens, top_tokens):
+        """(B, N_f, D), (B, N_t, D) → (B, D) CLS output"""
+        x = self._build_sequence(front_tokens, top_tokens)
+
+        for layer in self.layers:
+            if self.grad_ckpt and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+
+        return self.norm(x[:, 0])  # CLS token only
+
+    @torch.no_grad()
+    def forward_with_attention(self, front_tokens, top_tokens):
+        """Forward + 각 layer의 attention weight 추출 (시각화용).
+
+        Returns:
+            cls_out: (B, D) — CLS token output
+            attentions: list of (B, H, N, N) attention matrices per layer
+        """
+        x = self._build_sequence(front_tokens, top_tokens)
+        attentions = []
+
+        for layer in self.layers:
+            # norm_first=True: self_attn(norm1(x))
+            x_norm = layer.norm1(x)
+            attn_out, attn_w = layer.self_attn(
+                x_norm, x_norm, x_norm,
+                need_weights=True, average_attn_weights=False,
+            )
+            # attn_w: (B, H, N, N)
+            attentions.append(attn_w)
+
+            # Complete the layer: residual + FFN
+            x = x + layer.dropout1(attn_out)
+            x = x + layer._ff_block(layer.norm2(x))
+
+        return self.norm(x[:, 0]), attentions
+
+
 class DualViewModel(nn.Module):
     """공유 백본 → Fusion → MLP Head
     head_type:
       - "attn_gate": Attention Gate Fusion → deep MLP (기존)
       - "simple":    Concat → BN+MLP (단순 헤드)
+      - "cross_attn": Token-level Cross-View Transformer Fusion
     """
 
     def __init__(self, backbone_key="eva02_large", pretrained=True,
                  num_classes=2, drop_rate=0.3,
                  use_video=False, num_video_frames=5,
-                 head_type="attn_gate"):
+                 head_type="attn_gate",
+                 fusion_layers=4, fusion_heads=8):
         super().__init__()
         cfg = BACKBONE_CONFIGS[backbone_key]
         self.backbone_key = backbone_key
@@ -93,7 +172,20 @@ class DualViewModel(nn.Module):
         feat_dim = self.backbone.num_features
         self.feat_dim = feat_dim
 
-        if head_type == "attn_gate":
+        if head_type == "cross_attn":
+            self.attn_gate = None
+            self.fusion = CrossViewFusion(
+                feat_dim, n_layers=fusion_layers,
+                n_heads=fusion_heads, dropout=drop_rate,
+            )
+            self.head = nn.Sequential(
+                nn.Dropout(drop_rate),
+                nn.Linear(feat_dim, 256),
+                nn.GELU(),
+                nn.Dropout(drop_rate * 0.5),
+                nn.Linear(256, num_classes),
+            )
+        elif head_type == "attn_gate":
             self.attn_gate = nn.Sequential(
                 nn.Linear(feat_dim * 2, feat_dim),
                 nn.GELU(),
@@ -129,7 +221,25 @@ class DualViewModel(nn.Module):
             return feats.view(B, N, -1).mean(dim=1)
         return self.backbone(images)
 
+    def get_patch_tokens(self, images):
+        """Extract patch tokens without pooling (for cross_attn)."""
+        feat = self.backbone.forward_features(images)
+        if feat.dim() == 4:
+            # ConvNeXt: (B, C, H, W) → (B, HW, C)
+            B, C, H, W = feat.shape
+            return feat.reshape(B, C, H * W).permute(0, 2, 1)
+        # ViT: strip CLS + register prefix tokens
+        n_prefix = getattr(self.backbone, 'num_prefix_tokens',
+                           5 if 'dinov2' in self.backbone_key else 1)
+        return feat[:, n_prefix:, :]
+
     def forward(self, front, top, video_frames=None, video_mask=None):
+        if self.head_type == "cross_attn":
+            tok_f = self.get_patch_tokens(front)
+            tok_t = self.get_patch_tokens(top)
+            fused = self.fusion(tok_f, tok_t)
+            return self.head(fused)
+
         f = self.encode(front)
         t = self.encode(top)
 
@@ -175,8 +285,12 @@ def get_backbone_choices():
 
 
 def enable_gradient_checkpointing(model):
+    ok = False
     bb = model.backbone
     if hasattr(bb, "set_grad_checkpointing"):
         bb.set_grad_checkpointing(True)
-        return True
-    return False
+        ok = True
+    if hasattr(model, 'fusion') and hasattr(model.fusion, 'grad_ckpt'):
+        model.fusion.grad_ckpt = True
+        ok = True
+    return ok
