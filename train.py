@@ -735,8 +735,8 @@ def main():
                    choices=["cosine", "cosine_wr"],
                    help="스케줄러 (cosine_wr: WarmRestarts T0=10)")
     p.add_argument("--head_type", type=str, default="simple",
-                   choices=["attn_gate", "simple"],
-                   help="Head 구조 (simple: concat+MLP)")
+                   choices=["attn_gate", "simple", "cross_attn"],
+                   help="Head 구조 (simple: concat+MLP, cross_attn: token-level fusion)")
     p.add_argument("--drop_rate", type=float, default=None,
                    help="Dropout rate (미지정 시 0.3)")
     p.add_argument("--simple_aug", action="store_true",
